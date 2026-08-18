@@ -1,8 +1,8 @@
 import { toast } from 'sonner'
 import { cn, formatDate, formatLatency, formatSize, getStatusColor, METHOD_CLASS, FOCUS_RING } from '@/lib/utils'
 import { copyText } from '@/lib/clipboard'
-import { Copy, Check, Zap, AlertTriangle, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, ChevronsDownUp, ChevronsUpDown, FileCode, ListTree, Layers, RotateCcw, Maximize2, Minimize2, ExternalLink, Terminal, Bookmark, BookmarkCheck, CheckCircle2, CircleDot, Tags, Search, X } from 'lucide-react'
-import { fetchBlob, fetchLogBody, updateLogAnnotation } from '@/lib/api'
+import { ArchiveRestore, Copy, Check, Zap, AlertTriangle, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, ChevronsDownUp, ChevronsUpDown, CloudCheck, CloudOff, FileCode, ListTree, Layers, RotateCcw, Maximize2, Minimize2, ExternalLink, Terminal, Bookmark, BookmarkCheck, CheckCircle2, CircleDot, Tags, Search, X } from 'lucide-react'
+import { fetchBlob, fetchLog, fetchLogBody, updateLogAnnotation } from '@/lib/api'
 import type { LiveLogEvent, RequestLog } from '@/lib/api'
 import { startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -13,6 +13,9 @@ import { BlobPanel } from './BlobPanel'
 import { mergeStreamBody } from '@/lib/streamMerge'
 import { collectTextSearchMatches, createJsonSearchPlan, MAX_RENDERED_SEARCH_MATCHES, type JsonSearchPlan } from '@/lib/jsonSearch'
 import { logRequestDiffPath } from '@/lib/routes'
+import { getLogBackupState } from '@/lib/backupStatus'
+import { getLogBodyStatus } from '@/lib/bodyStatus'
+import { useArchiveFeatureEnabled } from '@/lib/archiveFeature'
 import { buildCurlCommand } from '@/lib/curlExport'
 import {
     Sheet,
@@ -211,6 +214,53 @@ function BodySearchBar({
     );
 }
 
+function LogBackupStatus({ log }: { log: RequestLog }) {
+    const { t, i18n } = useTranslation()
+    const backupState = getLogBackupState(log)
+    const restored = backupState === 'restored'
+    const verified = backupState === 'verified_cleanup' || backupState === 'verified_saved'
+    const Icon = restored ? ArchiveRestore : verified ? CloudCheck : CloudOff
+    const title = restored
+        ? t('log_backup.restored')
+        : verified
+            ? backupState === 'verified_saved'
+                ? t('log_backup.saved_retained')
+                : t('log_backup.waiting_cleanup')
+            : t('log_backup.pending')
+
+    return (
+        <div className="flex min-w-0 items-start gap-3 border-y border-border px-1 py-2.5">
+            <div className={cn(
+                'mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md',
+                restored ? 'bg-info/10 text-info' : verified ? 'bg-success/10 text-success' : 'bg-muted text-muted-foreground',
+            )}>
+                <Icon className="h-4 w-4" />
+            </div>
+            <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                    <span className="text-xs font-medium text-muted-foreground">{t('log_backup.title')}</span>
+                    <span className="text-xs font-semibold text-foreground">{title}</span>
+                </div>
+                <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                    {restored && <span>{t('log_backup.restored_hint')}</span>}
+                    {!restored && !verified && <span>{t('log_backup.pending_hint')}</span>}
+                    {verified && log.backup_verified_at && (
+                        <span>{t('log_backup.verified_at', { time: formatDate(log.backup_verified_at, i18n.language) })}</span>
+                    )}
+                    {verified && !log.annotation?.saved && log.delete_eligible_at && (
+                        <span>{t('log_backup.delete_at', { time: formatDate(log.delete_eligible_at, i18n.language) })}</span>
+                    )}
+                </div>
+                {verified && log.backup_batch_id && (
+                    <div className="mt-1 break-all font-mono text-xs text-muted-foreground">
+                        {t('log_backup.batch', { id: log.backup_batch_id })}
+                    </div>
+                )}
+            </div>
+        </div>
+    )
+}
+
 export function LogDetail({
     log,
     loading,
@@ -223,16 +273,19 @@ export function LogDetail({
 }: LogDetailProps) {
     const { t, i18n } = useTranslation()
     const navigate = useNavigate()
+    const archiveEnabled = useArchiveFeatureEnabled()
     const [liveLog, setLiveLog] = useState<RequestLog | null>(null)
     const [copiedField, setCopiedField] = useState<string | null>(null)
     const [fullRequestBody, setFullRequestBody] = useState<string | null>(null)
     const [fullResponseBody, setFullResponseBody] = useState<string | null>(null)
+    const [originalRequestBodyLoaded, setOriginalRequestBodyLoaded] = useState('')
+    const [finalRequestBodyLoaded, setFinalRequestBodyLoaded] = useState('')
     const [blobLoading, setBlobLoading] = useState<{ request: boolean; response: boolean }>({
         request: false,
         response: false,
     })
     const [blobError, setBlobError] = useState<string | null>(null)
-    const [previewOnly, setPreviewOnly] = useState<{ request: boolean; response: boolean }>({
+    const [autoLoadDisabled, setAutoLoadDisabled] = useState<{ request: boolean; response: boolean }>({
         request: false,
         response: false,
     })
@@ -260,9 +313,11 @@ export function LogDetail({
         setLiveLog(null)
         setFullRequestBody(null)
         setFullResponseBody(null)
+        setOriginalRequestBodyLoaded('')
+        setFinalRequestBodyLoaded('')
         setBlobError(null)
         setBlobLoading({ request: false, response: false })
-        setPreviewOnly({ request: false, response: false })
+        setAutoLoadDisabled({ request: false, response: false })
         setRequestViewMode('pretty')
         setResponseViewMode('pretty')
         setRequestExpandMode('default')
@@ -273,6 +328,24 @@ export function LogDetail({
         setResponseSearchOpen(false)
         setResponseSearchTerm('')
     }, [log?.id])
+
+    useEffect(() => {
+        if (!log?.id) return
+        const parts = new Set(log.bodies?.map(body => body.part) ?? [])
+        if (!parts.has('request_original') && !parts.has('request_final')) return
+        let cancelled = false
+        Promise.all([
+            parts.has('request_original') ? fetchLogBody(log.id, 'request_original') : Promise.resolve({ body: '' }),
+            parts.has('request_final') ? fetchLogBody(log.id, 'request_final') : Promise.resolve({ body: '' }),
+        ]).then(([original, final]) => {
+            if (cancelled) return
+            setOriginalRequestBodyLoaded(original.body)
+            setFinalRequestBodyLoaded(final.body)
+        }).catch(() => {
+            // The ordinary request body remains available even if a diff part is damaged.
+        })
+        return () => { cancelled = true }
+    }, [log?.id, log?.bodies])
 
     useEffect(() => {
         setAnnotationNote(displayLog?.annotation?.note ?? '')
@@ -351,7 +424,7 @@ export function LogDetail({
 
     const capturedRequestBody = fullRequestBody ?? displayLog?.request_body ?? ''
     const effectiveResponseBody = fullResponseBody ?? displayLog?.response_body ?? ''
-    const originalRequestBody = displayLog?.request_body_original ?? ''
+    const originalRequestBody = originalRequestBodyLoaded || displayLog?.request_body_original || ''
     const showsOriginalRequestBody = Boolean(
         displayLog?.request_override_error &&
         !displayLog?.request_body_ref &&
@@ -359,7 +432,7 @@ export function LogDetail({
         originalRequestBody,
     )
     const effectiveRequestBody = showsOriginalRequestBody ? originalRequestBody : capturedRequestBody
-    const finalRequestBody = displayLog?.request_body_final ?? (originalRequestBody ? capturedRequestBody : '')
+    const finalRequestBody = finalRequestBodyLoaded || displayLog?.request_body_final || (originalRequestBody ? capturedRequestBody : '')
     const hasRequestBodyDiff = Boolean(originalRequestBody && finalRequestBody && originalRequestBody !== finalRequestBody)
     const requestBodyDisplaySize = showsOriginalRequestBody
         ? textByteSize(originalRequestBody)
@@ -380,6 +453,7 @@ export function LogDetail({
     const hasUsage = displayLog?.usage_input_tokens !== undefined ||
         displayLog?.usage_output_tokens !== undefined ||
         displayLog?.usage_total_tokens !== undefined
+    const bodyStatus = displayLog ? getLogBodyStatus(displayLog) : null
 
     useEffect(() => {
         if (!hasRequestBodyDiff && requestViewMode === 'diff') {
@@ -464,7 +538,7 @@ export function LogDetail({
 
     const loadBlob = useCallback(async (kind: 'request' | 'response', ref: string) => {
         setBlobError(null)
-        setPreviewOnly(prev => ({ ...prev, [kind]: false }))
+        setAutoLoadDisabled(prev => ({ ...prev, [kind]: false }))
         setBlobLoading(prev => ({ ...prev, [kind]: true }))
         try {
             const body = displayLog?.id ? (await fetchLogBody(displayLog.id, kind)).body : await fetchBlob(ref)
@@ -474,7 +548,7 @@ export function LogDetail({
             })
         } catch (err: unknown) {
             setBlobError(err instanceof Error ? err.message : 'Failed to load blob')
-            setPreviewOnly(prev => ({ ...prev, [kind]: true }))
+            setAutoLoadDisabled(prev => ({ ...prev, [kind]: true }))
         } finally {
             setBlobLoading(prev => ({ ...prev, [kind]: false }))
         }
@@ -484,7 +558,7 @@ export function LogDetail({
         const currentLog = displayLog
         if (!currentLog) return
 
-        if (!currentLog.request_body_final && currentLog.request_body_ref && !fullRequestBody) {
+        if (!finalRequestBodyLoaded && !currentLog.request_body_final && currentLog.request_body_ref && !fullRequestBody) {
             if (!blobLoading.request) {
                 void loadBlob('request', currentLog.request_body_ref)
             }
@@ -492,9 +566,9 @@ export function LogDetail({
             return
         }
 
-        let body = currentLog.request_body_final || fullRequestBody || currentLog.request_body || ''
+        let body = finalRequestBodyLoaded || currentLog.request_body_final || fullRequestBody || currentLog.request_body || ''
         if (!body && currentLog.request_override_error) {
-            body = currentLog.request_body_original || ''
+            body = originalRequestBodyLoaded || currentLog.request_body_original || ''
         }
         void copyToClipboard(buildCurlCommand(currentLog, body), 'curl')
     }
@@ -504,7 +578,14 @@ export function LogDetail({
         setAnnotationSaving(true)
         try {
             const nextAnnotation = await updateLogAnnotation(displayLog.id, update)
-            const nextLog = { ...displayLog, annotation: nextAnnotation }
+            let nextLog = { ...displayLog, annotation: nextAnnotation }
+            if (update.saved !== undefined && displayLog.backup_verified_at) {
+                try {
+                    nextLog = await fetchLog(displayLog.id)
+                } catch {
+                    // Keep the successful annotation update even if the detail refresh fails.
+                }
+            }
             startTransition(() => {
                 setLiveLog(current => current?.id === nextLog.id ? { ...current, annotation: nextAnnotation } : current)
                 onLogChange?.(nextLog)
@@ -526,7 +607,7 @@ export function LogDetail({
             previewBody: displayLog.request_body ?? '',
             fullBody: fullRequestBody,
             loading: blobLoading.request,
-            previewOnly: previewOnly.request,
+            autoLoadDisabled: autoLoadDisabled.request,
         })) {
             loadBlob('request', displayLog.request_body_ref!)
         }
@@ -538,7 +619,7 @@ export function LogDetail({
             previewBody: displayLog.response_body ?? '',
             fullBody: fullResponseBody,
             loading: blobLoading.response,
-            previewOnly: previewOnly.response,
+            autoLoadDisabled: autoLoadDisabled.response,
         })) {
             loadBlob('response', displayLog.response_body_ref!)
         }
@@ -550,8 +631,8 @@ export function LogDetail({
         fullResponseBody,
         blobLoading.request,
         blobLoading.response,
-        previewOnly.request,
-        previewOnly.response,
+        autoLoadDisabled.request,
+        autoLoadDisabled.response,
         loadBlob,
     ])
 
@@ -1012,6 +1093,8 @@ export function LogDetail({
                         ) : null}
                     </div>
 
+                    {archiveEnabled && <LogBackupStatus log={displayLog} />}
+
                     {/* 错误详情 */}
                     {displayLog.error && (
                         <div className="overflow-hidden rounded-lg border border-danger/20 bg-danger/5 p-4">
@@ -1141,9 +1224,9 @@ export function LogDetail({
                                 extra={
                                     <div className="flex items-center gap-2">
                                         <span className="text-xs font-medium text-muted-foreground">{formatSize(requestBodyDisplaySize)}</span>
-                                        {displayLog.truncated && (
+                                        {bodyStatus?.requestTruncated && (
                                             <Badge variant="outline" className="h-5 text-xs border-warning/40 text-warning bg-warning/5 px-1.5 font-semibold">
-                                                {t('log_detail.truncated_tag', 'TRUNCATED')}
+                                                {t('log_detail.truncated_tag')}
                                             </Badge>
                                         )}
                                     </div>
@@ -1161,10 +1244,6 @@ export function LogDetail({
                                             loading={blobLoading.request}
                                             error={blobError}
                                             onLoad={() => loadBlob('request', displayLog.request_body_ref!)}
-                                            onUsePreview={() => {
-                                                setPreviewOnly(prev => ({ ...prev, request: true }))
-                                                setFullRequestBody(null)
-                                            }}
                                         />
                                     )}
 
@@ -1287,10 +1366,22 @@ export function LogDetail({
                                 extra={
                                     <div className="flex items-center gap-2">
                                         <span className="text-xs font-medium text-muted-foreground">{formatSize(displayLog.response_body_size)}</span>
-                                        {displayLog.truncated && (
+                                        {bodyStatus?.responseTruncated && (
                                             <Badge variant="outline" className="h-5 text-xs border-warning/40 text-warning bg-warning/5 px-1.5 font-semibold">
-                                                {t('log_detail.truncated_tag', 'TRUNCATED')}
+                                                {t('log_detail.truncated_tag')}
                                             </Badge>
+                                        )}
+                                        {bodyStatus?.responseInterrupted && (
+                                            <Tooltip>
+                                                <TooltipTrigger asChild>
+                                                    <Badge variant="outline" className="h-5 cursor-help border-warning/40 bg-warning/5 px-1.5 text-xs font-semibold text-warning">
+                                                        {t('log_detail.response_interrupted_tag')}
+                                                    </Badge>
+                                                </TooltipTrigger>
+                                                <TooltipContent side="top" sideOffset={4} className="max-w-xs">
+                                                    {t('log_detail.response_interrupted_hint')}
+                                                </TooltipContent>
+                                            </Tooltip>
                                         )}
                                     </div>
                                 }
@@ -1320,10 +1411,6 @@ export function LogDetail({
                                             loading={blobLoading.response}
                                             error={blobError}
                                             onLoad={() => loadBlob('response', displayLog.response_body_ref!)}
-                                            onUsePreview={() => {
-                                                setPreviewOnly(prev => ({ ...prev, response: true }))
-                                                setFullResponseBody(null)
-                                            }}
                                         />
                                     )}
 
@@ -1453,7 +1540,7 @@ function shouldAutoLoadBody({
     previewBody,
     fullBody,
     loading,
-    previewOnly,
+    autoLoadDisabled,
 }: {
     blobRef?: string
     bodySize?: number
@@ -1461,9 +1548,9 @@ function shouldAutoLoadBody({
     previewBody: string
     fullBody: string | null
     loading: boolean
-    previewOnly: boolean
+    autoLoadDisabled: boolean
 }) {
-    if (!blobRef || fullBody !== null || loading || previewOnly) return false
+    if (!blobRef || fullBody !== null || loading || autoLoadDisabled) return false
     if (!bodySize || bodySize > autoLoadFullBodyLimit) return false
     if (isBinaryPlaceholder(previewBody)) return false
     return isAutoLoadableTextContent(contentType, previewBody)

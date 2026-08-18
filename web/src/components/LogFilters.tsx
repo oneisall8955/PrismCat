@@ -15,6 +15,7 @@ import {
     SelectValue,
 } from "@/components/ui/select"
 import { Badge } from "@/components/ui/badge"
+import { useArchiveFeatureEnabled } from '@/lib/archiveFeature'
 import {
     Table,
     TableBody,
@@ -69,8 +70,9 @@ export function LogFilters({
     identityAuditEnabled,
     onIdentityResolutionComplete,
 }: LogFiltersProps) {
-    const { t } = useTranslation()
-    const [identityOptions, setIdentityOptions] = useState<UpstreamIdentity[]>([])
+	const { t } = useTranslation()
+	const archiveEnabled = useArchiveFeatureEnabled()
+	const [identityOptions, setIdentityOptions] = useState<UpstreamIdentity[]>([])
     const [identitySources, setIdentitySources] = useState<IdentitySourceStatus[]>([])
     const [identityQuery, setIdentityQuery] = useState('')
     const [identityPage, setIdentityPage] = useState(1)
@@ -80,8 +82,8 @@ export function LogFilters({
     const [selectedIdentity, setSelectedIdentity] = useState<UpstreamIdentity | null>(null)
     const [identityOpen, setIdentityOpen] = useState(false)
     const [resolutionRequesting, setResolutionRequesting] = useState(false)
-    const resolutionWasActive = useRef(false)
-    const identityPickerRef = useRef<HTMLDivElement>(null)
+	const resolutionWasActive = useRef(false)
+	const identityPickerRef = useRef<HTMLDivElement>(null)
 
     // 本地暂存的筛选条件（不触发查询）
     const [draftState, setDraftState] = useState(() => ({
@@ -226,14 +228,15 @@ export function LogFilters({
     const isTagChanged = (draft.tag || '') !== (filter.tag || '')
     const isSavedChanged = (draft.saved ?? undefined) !== (filter.saved ?? undefined)
     const isAnnotationStatusChanged = (draft.annotation_status || '') !== (filter.annotation_status || '')
-    const isAnnotationLabelChanged = (draft.annotation_label || '') !== (filter.annotation_label || '')
-    const isIdentityChanged = (draft.identity_id || '') !== (filter.identity_id || '') ||
+	const isAnnotationLabelChanged = (draft.annotation_label || '') !== (filter.annotation_label || '')
+	const isBackupStatusChanged = archiveEnabled && (draft.backup_status || '') !== (filter.backup_status || '')
+	const isIdentityChanged = (draft.identity_id || '') !== (filter.identity_id || '') ||
         (draft.identity_upstream || '') !== (filter.identity_upstream || '') ||
         (draft.identity_target || '') !== (filter.identity_target || '')
-    const isTimeChanged = (draft.start_time || '') !== (filter.start_time || '') ||
-        (draft.end_time || '') !== (filter.end_time || '')
-    const hasChanges = isPathChanged || isUpstreamChanged || isMethodChanged || isStatusCodeChanged || isTraceIdChanged || isTagChanged ||
-        isSavedChanged || isAnnotationStatusChanged || isAnnotationLabelChanged || isIdentityChanged || isTimeChanged
+	const isTimeChanged = (draft.start_time || '') !== (filter.start_time || '') ||
+		(draft.end_time || '') !== (filter.end_time || '')
+	const hasChanges = isPathChanged || isUpstreamChanged || isMethodChanged || isStatusCodeChanged || isTraceIdChanged || isTagChanged ||
+		isSavedChanged || isAnnotationStatusChanged || isAnnotationLabelChanged || isBackupStatusChanged || isIdentityChanged || isTimeChanged
 
     const requestedIdentityUpstream = draft.identity_upstream || draft.upstream || ''
     const requestedIdentityTarget = draft.identity_target || ''
@@ -307,13 +310,14 @@ export function LogFilters({
                     resolved: resolutionSource.resolved_logs,
                     unmatched: resolutionSource.unmatched_logs,
                 })
-                : t('filters.identity_resolution_action')
+				: t('filters.identity_resolution_action')
 
     // 次级筛选默认收起,但只要有生效的条件就展开,避免"筛了却看不见"
-    const activeAdvancedCount = [
-        draft.upstream, draft.method, draft.status_code, draft.tag,
-        draft.saved, draft.annotation_status, draft.annotation_label,
-        identityAuditEnabled ? draft.identity_id : undefined,
+	const activeAdvancedCount = [
+		draft.upstream, draft.method, draft.status_code, draft.tag,
+		draft.saved, draft.annotation_status, draft.annotation_label,
+		archiveEnabled ? draft.backup_status : undefined,
+		identityAuditEnabled ? draft.identity_id : undefined,
     ].filter(value => value !== undefined && value !== '').length
     const [showAdvanced, setShowAdvanced] = useState(activeAdvancedCount > 0)
 
@@ -444,9 +448,9 @@ export function LogFilters({
                 </div>
             </div>
 
-            {showAdvanced && (
-                <>
-                <div className="grid grid-cols-2 gap-2 md:grid-cols-4 xl:grid-cols-7">
+			{showAdvanced && (
+				<>
+				<div className="grid grid-cols-2 gap-2 md:grid-cols-4 xl:grid-cols-8">
                     <Select
                         value={draft.upstream || "all"}
                         onValueChange={(val) => {
@@ -703,6 +707,27 @@ export function LogFilters({
                             <SelectItem value="unsaved">{t('filters.unsaved_only')}</SelectItem>
                         </SelectContent>
                     </Select>
+
+                    {archiveEnabled && <Select
+                        value={draft.backup_status || 'all'}
+                        onValueChange={(val) => setDraft({
+                            ...draft,
+                            backup_status: val === 'all' ? undefined : val as LogFilter['backup_status'],
+                        })}
+                    >
+                        <SelectTrigger className={cn(
+                            "w-full h-8 bg-background border border-input hover:bg-accent",
+                            isBackupStatusChanged && "border-primary/50 ring-1 ring-primary/20"
+                        )}>
+                            <SelectValue placeholder={t('filters.backup_all')} />
+                        </SelectTrigger>
+                        <SelectContent>
+                            <SelectItem value="all">{t('filters.backup_all')}</SelectItem>
+                            <SelectItem value="pending">{t('filters.backup_pending')}</SelectItem>
+                            <SelectItem value="verified">{t('filters.backup_verified')}</SelectItem>
+                            <SelectItem value="restored">{t('filters.backup_restored')}</SelectItem>
+                        </SelectContent>
+                    </Select>}
 
                     <Select
                         value={draft.annotation_status || 'all'}

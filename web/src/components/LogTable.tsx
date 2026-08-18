@@ -1,6 +1,8 @@
 import { cn, formatDate, formatLatency, METHOD_CLASS, getStatusColor } from '@/lib/utils'
-import { BookmarkCheck, CheckCircle2, ChevronRight, CircleDot, Clock3, Network, Server, SlidersHorizontal, Tag as TagIcon, Tags, UserRound, Zap } from 'lucide-react'
+import { ArchiveRestore, BookmarkCheck, CheckCircle2, ChevronRight, CircleDot, Clock3, CloudCheck, CloudOff, Network, Server, SlidersHorizontal, Tag as TagIcon, Tags, UserRound, Zap } from 'lucide-react'
 import type { RequestLog } from '@/lib/api'
+import { getLogBackupState } from '@/lib/backupStatus'
+import { useArchiveFeatureEnabled } from '@/lib/archiveFeature'
 import { useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import {
@@ -49,6 +51,53 @@ function formatTokenCount(value?: number): string {
     return value.toLocaleString()
 }
 
+function BackupStatusIndicator({ log, showLabel = false }: { log: RequestLog; showLabel?: boolean }) {
+    const { t, i18n } = useTranslation()
+    const backupState = getLogBackupState(log)
+    const restored = backupState === 'restored'
+    const verified = backupState === 'verified_cleanup' || backupState === 'verified_saved'
+    const Icon = restored ? ArchiveRestore : verified ? CloudCheck : CloudOff
+    const label = restored
+        ? t('log_backup.restored')
+        : verified
+            ? t('log_backup.verified')
+            : t('log_backup.pending')
+    const statusClass = restored
+        ? 'bg-info/10 text-info'
+        : verified
+            ? 'bg-success/10 text-success'
+            : 'bg-muted text-muted-foreground'
+
+    return (
+        <Tooltip>
+            <TooltipTrigger asChild>
+                <span className={cn(
+                    'inline-flex shrink-0 items-center gap-1 rounded-md',
+                    showLabel ? 'px-2.5 py-1 text-xs font-medium' : 'p-0.5',
+                    showLabel && statusClass,
+                    !showLabel && (restored ? 'text-info' : verified ? 'text-success' : 'text-muted-foreground'),
+                )}>
+                    <Icon className="h-3.5 w-3.5" />
+                    {showLabel && <span>{label}</span>}
+                </span>
+            </TooltipTrigger>
+            <TooltipContent side="right" className="max-w-[360px]">
+                <p className="text-xs font-medium">{label}</p>
+                {restored && <p className="text-xs text-muted-foreground">{t('log_backup.restored_hint')}</p>}
+                {!restored && !verified && <p className="text-xs text-muted-foreground">{t('log_backup.pending_hint')}</p>}
+                {verified && log.backup_verified_at && (
+                    <p className="text-xs text-muted-foreground">
+                        {t('log_backup.verified_at', { time: formatDate(log.backup_verified_at, i18n.language) })}
+                    </p>
+                )}
+                {verified && log.backup_batch_id && (
+                    <p className="break-all font-mono text-xs text-muted-foreground">{t('log_backup.batch', { id: log.backup_batch_id })}</p>
+                )}
+            </TooltipContent>
+        </Tooltip>
+    )
+}
+
 function MobileLogSkeleton() {
     return (
         <div className="space-y-3 md:hidden">
@@ -71,7 +120,7 @@ function MobileLogSkeleton() {
     )
 }
 
-function DesktopLogSkeleton({ t, identityAuditEnabled }: { t: (key: string) => string; identityAuditEnabled: boolean }) {
+function DesktopLogSkeleton({ t, showUsage, showBackup, identityAuditEnabled }: { t: (key: string) => string; showUsage: boolean; showBackup: boolean; identityAuditEnabled: boolean }) {
     return (
         <div className="hidden rounded-lg overflow-hidden bg-card md:block">
             <Table>
@@ -82,6 +131,8 @@ function DesktopLogSkeleton({ t, identityAuditEnabled }: { t: (key: string) => s
                         <TableHead className="w-[150px]">{t('log_table.upstream')}</TableHead>
                         {identityAuditEnabled && <TableHead className="w-[150px]">{t('log_table.identity')}</TableHead>}
                         <TableHead>{t('log_table.path')}</TableHead>
+                        {showBackup && <TableHead className="w-[110px] text-center">{t('log_table.backup')}</TableHead>}
+                        {showUsage && <TableHead className="w-[90px] text-right">{t('log_table.tokens')}</TableHead>}
                         <TableHead className="w-[80px] text-right">{t('log_table.latency')}</TableHead>
                         <TableHead className="w-[160px] text-right">{t('log_table.time')}</TableHead>
                         <TableHead className="w-10"></TableHead>
@@ -90,7 +141,7 @@ function DesktopLogSkeleton({ t, identityAuditEnabled }: { t: (key: string) => s
                 <TableBody>
                     {Array.from({ length: 8 }).map((_, rowIndex) => (
                         <TableRow key={rowIndex}>
-                            {Array.from({ length: identityAuditEnabled ? 8 : 7 }).map((_, cellIndex) => (
+                            {Array.from({ length: 7 + Number(showUsage) + Number(showBackup) + Number(identityAuditEnabled) }).map((_, cellIndex) => (
                                 <TableCell key={cellIndex}>
                                     <Skeleton className="h-5 w-full bg-muted/50" />
                                 </TableCell>
@@ -132,6 +183,7 @@ function MobileLogCard({
     showUsage: boolean
     identityAuditEnabled: boolean
 }) {
+    const archiveEnabled = useArchiveFeatureEnabled()
     return (
         <button
             type="button"
@@ -208,6 +260,7 @@ function MobileLogCard({
                                 {savedLabel}
                             </span>
                         )}
+                        {archiveEnabled && <BackupStatusIndicator log={log} showLabel />}
                         {log.annotation?.status === 'todo' && (
                             <span className="inline-flex items-center gap-1 rounded-md bg-warning/10 px-2.5 py-1 text-xs font-medium text-warning">
                                 <CircleDot className="h-3 w-3" />
@@ -258,13 +311,14 @@ function MobileLogCard({
 export function LogTable({ logs, loading, onSelect, selectedId, identityAuditEnabled }: LogTableProps) {
     const { t, i18n } = useTranslation()
     const navigate = useNavigate()
+    const archiveEnabled = useArchiveFeatureEnabled()
     const showUsage = logs.some(log => typeof log.usage_total_tokens === 'number')
 
     if (loading) {
         return (
             <>
                 <MobileLogSkeleton />
-                <DesktopLogSkeleton t={t} identityAuditEnabled={identityAuditEnabled} />
+                <DesktopLogSkeleton t={t} showUsage={showUsage} showBackup={archiveEnabled} identityAuditEnabled={identityAuditEnabled} />
             </>
         )
     }
@@ -315,6 +369,7 @@ export function LogTable({ logs, loading, onSelect, selectedId, identityAuditEna
                             <TableHead className="w-[150px] font-medium text-xs">{t('log_table.upstream')}</TableHead>
                             {identityAuditEnabled && <TableHead className="w-[150px] font-medium text-xs">{t('log_table.identity')}</TableHead>}
                             <TableHead className="font-medium text-xs">{t('log_table.path')}</TableHead>
+                            {archiveEnabled && <TableHead className="w-[110px] font-medium text-xs text-center">{t('log_table.backup')}</TableHead>}
                             {showUsage && (
                                 <TableHead className="w-[90px] font-medium text-xs text-right">{t('log_table.tokens', 'Tokens')}</TableHead>
                             )}
@@ -484,6 +539,11 @@ export function LogTable({ logs, loading, onSelect, selectedId, identityAuditEna
                                         ))}
                                     </div>
                                 </TableCell>
+                                {archiveEnabled && (
+                                    <TableCell className="text-center">
+                                        <BackupStatusIndicator log={log} showLabel />
+                                    </TableCell>
+                                )}
                                 {showUsage && (
                                     <TableCell className="text-right">
                                         <span className="font-mono text-xs font-semibold text-muted-foreground">

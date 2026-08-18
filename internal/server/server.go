@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/paopaoandlingyia/PrismCat/internal/api"
+	"github.com/paopaoandlingyia/PrismCat/internal/archive"
 	"github.com/paopaoandlingyia/PrismCat/internal/auth"
 	"github.com/paopaoandlingyia/PrismCat/internal/config"
 	"github.com/paopaoandlingyia/PrismCat/internal/live"
@@ -193,20 +194,16 @@ type Server struct {
 }
 
 // New 创建服务器实例
-func New(cfg *config.Config, repo storage.Repository, blobs storage.BlobStore, identityManagers ...*upstreamidentity.Manager) *Server {
-	liveRegistry := live.NewRegistry(cfg.LoggingSnapshot().BodyPreviewBytes)
+func New(cfg *config.Config, repo storage.Repository, blobs storage.BlobStore, archiveManager *archive.Manager, identityManager *upstreamidentity.Manager) *Server {
+	liveRegistry := live.NewRegistry(live.DefaultPreviewLimit)
 	traceSeq := trace.NewSequencer()
-	var identityManager *upstreamidentity.Manager
-	if len(identityManagers) > 0 {
-		identityManager = identityManagers[0]
-	}
 	return &Server{
 		cfg:      cfg,
 		repo:     repo,
 		blobs:    blobs,
 		live:     liveRegistry,
 		proxy:    proxy.New(cfg, repo, liveRegistry, traceSeq),
-		api:      api.New(cfg, repo, blobs, liveRegistry, identityManager),
+		api:      api.New(cfg, repo, blobs, liveRegistry, archiveManager, identityManager),
 		auth:     auth.NewManager(cfg),
 		identity: identityManager,
 	}

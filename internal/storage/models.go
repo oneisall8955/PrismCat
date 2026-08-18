@@ -36,6 +36,7 @@ type RequestLog struct {
 	ResponseBody     string              `json:"response_body,omitempty"`
 	ResponseBodyRef  string              `json:"response_body_ref,omitempty"`
 	ResponseBodySize int64               `json:"response_body_size"`
+	Bodies           []LogBody           `json:"bodies,omitempty"`
 
 	// 元数据
 	Streaming                    bool                `json:"streaming"`       // 是否为流式响应
@@ -57,6 +58,13 @@ type RequestLog struct {
 	UsageTotalTokens             *int64              `json:"usage_total_tokens,omitempty"`
 	UsageRaw                     string              `json:"usage_raw,omitempty"`
 	UsageSource                  string              `json:"usage_source,omitempty"`
+	BodyStorageError             string              `json:"body_storage_error,omitempty"`
+	Origin                       string              `json:"origin,omitempty"`
+	BackupVerifiedAt             *time.Time          `json:"backup_verified_at,omitempty"`
+	BackupBatchID                string              `json:"backup_batch_id,omitempty"`
+	DeleteGraceStartedAt         *time.Time          `json:"delete_grace_started_at,omitempty"`
+	DeleteEligibleAt             *time.Time          `json:"delete_eligible_at,omitempty"`
+	ImportBatchID                string              `json:"import_batch_id,omitempty"`
 	Annotation                   LogAnnotation       `json:"annotation"`
 
 	// Transient capture state used only before async persistence.
@@ -68,6 +76,38 @@ type RequestLog struct {
 	ResponseBodyCaptureTruncated bool   `json:"-"`
 	APIKeyFingerprint            string `json:"-"`
 	IdentityResolutionReady      bool   `json:"-"`
+}
+
+const (
+	BodyPartRequest         = "request"
+	BodyPartRequestOriginal = "request_original"
+	BodyPartRequestFinal    = "request_final"
+	BodyPartResponse        = "response"
+)
+
+type LogBody struct {
+	LogID           string `json:"-"`
+	Part            string `json:"part"`
+	BlobRef         string `json:"blob_ref,omitempty"`
+	CapturedBytes   int64  `json:"captured_bytes"`
+	TotalBytes      int64  `json:"total_bytes"`
+	Truncated       bool   `json:"truncated"`
+	ContentType     string `json:"content_type,omitempty"`
+	ContentEncoding string `json:"content_encoding,omitempty"`
+	Representation  string `json:"representation"`
+	Recoverable     bool   `json:"recoverable"`
+}
+
+func (l *RequestLog) Body(part string) (LogBody, bool) {
+	if l == nil {
+		return LogBody{}, false
+	}
+	for _, body := range l.Bodies {
+		if body.Part == part {
+			return body, true
+		}
+	}
+	return LogBody{}, false
 }
 
 type LogAnnotation struct {
@@ -97,11 +137,18 @@ type LogFilter struct {
 	IdentityID       string     // 上游身份 ID
 	IdentityUpstream string     // 身份所属 upstream
 	IdentityTarget   string     // 身份所属 target preset
+	BackupStatus     string     // 备份状态：pending/verified/restored
 
 	// 分页
 	Offset int
 	Limit  int
 }
+
+const (
+	BackupStatusPending  = "pending"
+	BackupStatusVerified = "verified"
+	BackupStatusRestored = "restored"
+)
 
 type PendingIdentityLog struct {
 	ID             string
@@ -182,6 +229,104 @@ type Repository interface {
 	Close() error
 }
 
+type BodyRepository interface {
+	GetLogBody(logID, part string) (LogBody, error)
+	GetLogBodies(logID string) ([]LogBody, error)
+}
+
+type BlobRefRepository interface {
+	ListBlobRefs() ([]string, error)
+}
+
+type ArchiveBatch struct {
+	ID              string     `json:"id"`
+	JobID           string     `json:"job_id,omitempty"`
+	Trigger         string     `json:"trigger,omitempty"`
+	ArchiveDate     string     `json:"archive_date"`
+	ObjectKey       string     `json:"object_key,omitempty"`
+	ManifestKey     string     `json:"manifest_key,omitempty"`
+	RangeStart      time.Time  `json:"range_start"`
+	RangeEnd        time.Time  `json:"range_end"`
+	Status          string     `json:"status"`
+	LogCount        int64      `json:"log_count"`
+	BodyCount       int64      `json:"body_count"`
+	LogicalBytes    int64      `json:"logical_bytes"`
+	CompressedBytes int64      `json:"compressed_bytes"`
+	SHA256          string     `json:"sha256,omitempty"`
+	Error           string     `json:"error,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+	VerifiedAt      *time.Time `json:"verified_at,omitempty"`
+}
+
+const (
+	ArchiveDateTypeCompletedAt = "completed_at"
+	ArchiveDateTypeArchiveDate = "archive_date"
+)
+
+type ArchiveBatchFilter struct {
+	DateType      string
+	Date          string
+	CompletedFrom *time.Time
+	CompletedTo   *time.Time
+	JobID         string
+	Offset        int
+	Limit         int
+}
+
+type ArchiveJob struct {
+	ID           string     `json:"id"`
+	Trigger      string     `json:"trigger"`
+	Cutoff       time.Time  `json:"cutoff"`
+	Status       string     `json:"status"`
+	PackageCount int64      `json:"package_count"`
+	LogCount     int64      `json:"log_count"`
+	Error        string     `json:"error,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+	CompletedAt  *time.Time `json:"completed_at,omitempty"`
+}
+
+type ArchiveImport struct {
+	ID        string     `json:"id"`
+	SourceKey string     `json:"source_key,omitempty"`
+	Status    string     `json:"status"`
+	LogCount  int64      `json:"log_count"`
+	Error     string     `json:"error,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+}
+
+type ArchiveRepository interface {
+	RecoverInterruptedArchiveWork(now time.Time) error
+	OldestUnarchivedLogTime(before time.Time) (*time.Time, error)
+	CreateArchiveJob(job ArchiveJob) error
+	UpdateArchiveJob(job ArchiveJob) error
+	ListArchiveJobs(limit int) ([]ArchiveJob, error)
+	ListArchiveJobsPage(offset, limit int) ([]ArchiveJob, int64, error)
+	CreateArchiveBatch(batch ArchiveBatch) error
+	UpdateArchiveBatch(batch ArchiveBatch) error
+	ListArchiveBatches(limit int) ([]ArchiveBatch, error)
+	ListArchiveBatchesPage(filter ArchiveBatchFilter) ([]ArchiveBatch, int64, error)
+	ReserveArchiveBatchLogs(batchID string, start, end time.Time) (int64, error)
+	ReleaseArchiveBatchLogs(batchID string) error
+	ExportArchiveBatch(ctx context.Context, batchID string, each func(*RequestLog) error) error
+	MarkArchiveBatchVerified(batchID string, verifiedAt time.Time) (int64, error)
+	DeleteEligibleBackedLogs(cutoff time.Time, limit int) (int64, error)
+	CountEligibleBackedLogs(cutoff time.Time) (int64, error)
+	PendingBackedLogCleanup() (int64, *time.Time, error)
+	LogExists(id string) (bool, error)
+	SaveImportedLog(log *RequestLog) error
+	CreateArchiveImport(batch ArchiveImport) error
+	UpdateArchiveImport(batch ArchiveImport) error
+	ListArchiveImports() ([]ArchiveImport, error)
+	ListArchiveImportsPage(offset, limit int) ([]ArchiveImport, int64, error)
+	DeleteArchiveImport(batchID string) (int64, error)
+	DeleteExpiredArchiveImports(now time.Time) (int64, error)
+	StageArchiveBlobRef(batchID, ref string) error
+	ClearArchiveBlobRefs(batchID string) error
+}
+
 // Clone returns a deep copy of the RequestLog.
 func (l *RequestLog) Clone() *RequestLog {
 	if l == nil {
@@ -195,6 +340,21 @@ func (l *RequestLog) Clone() *RequestLog {
 	out.RequestBodyOriginalRaw = cloneBytes(l.RequestBodyOriginalRaw)
 	out.RequestBodyFinalRaw = cloneBytes(l.RequestBodyFinalRaw)
 	out.ResponseBodyRaw = cloneBytes(l.ResponseBodyRaw)
+	if len(l.Bodies) > 0 {
+		out.Bodies = append([]LogBody(nil), l.Bodies...)
+	}
+	if l.BackupVerifiedAt != nil {
+		v := *l.BackupVerifiedAt
+		out.BackupVerifiedAt = &v
+	}
+	if l.DeleteGraceStartedAt != nil {
+		v := *l.DeleteGraceStartedAt
+		out.DeleteGraceStartedAt = &v
+	}
+	if l.DeleteEligibleAt != nil {
+		v := *l.DeleteEligibleAt
+		out.DeleteEligibleAt = &v
+	}
 	if len(l.RequestOverrideRules) > 0 {
 		out.RequestOverrideRules = append([]string(nil), l.RequestOverrideRules...)
 	}

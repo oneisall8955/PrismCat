@@ -49,11 +49,14 @@ func TestIdentityConfigAPISecretsAndMergeSemantics(t *testing.T) {
 }
 
 func TestParseLogFilterIncludesIdentityScope(t *testing.T) {
-	filter := parseLogFilter(url.Values{
+	filter, err := parseLogFilter(url.Values{
 		"identity_id":       {"123"},
 		"identity_upstream": {"alpha"},
 		"identity_target":   {"backup"},
 	}, false)
+	if err != nil {
+		t.Fatalf("parse identity filter: %v", err)
+	}
 	if filter.IdentityID != "123" || filter.IdentityUpstream != "alpha" || filter.IdentityTarget != "backup" {
 		t.Fatalf("identity filter = %#v", filter)
 	}

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/paopaoandlingyia/PrismCat/internal/archive"
 	"github.com/paopaoandlingyia/PrismCat/internal/config"
 	"github.com/paopaoandlingyia/PrismCat/internal/httpbody"
 	"github.com/paopaoandlingyia/PrismCat/internal/live"
@@ -33,16 +34,13 @@ type Handler struct {
 	clients  *outbound.ClientCache
 	metrics  *systemmetrics.Collector
 	updates  *updatecheck.Checker
+	archives *archive.Manager
 	identity *upstreamidentity.Manager
 }
 
 // New 创建 API 处理器
-func New(cfg *config.Config, repo storage.Repository, blobs storage.BlobStore, liveRegistry *live.Registry, identityManagers ...*upstreamidentity.Manager) *Handler {
-	var identityManager *upstreamidentity.Manager
-	if len(identityManagers) > 0 {
-		identityManager = identityManagers[0]
-	}
-	return &Handler{
+func New(cfg *config.Config, repo storage.Repository, blobs storage.BlobStore, liveRegistry *live.Registry, archiveManager *archive.Manager, identityManager *upstreamidentity.Manager) *Handler {
+	h := &Handler{
 		cfg:      cfg,
 		repo:     repo,
 		blobs:    blobs,
@@ -50,8 +48,13 @@ func New(cfg *config.Config, repo storage.Repository, blobs storage.BlobStore, l
 		clients:  outbound.NewClientCache(50, 10),
 		metrics:  systemmetrics.NewCollector(),
 		updates:  updatecheck.NewChecker(),
+		archives: archiveManager,
 		identity: identityManager,
 	}
+	if h.archives == nil {
+		h.archives, _ = archive.NewManager(cfg, repo, blobs)
+	}
+	return h
 }
 
 // RegisterRoutes 注册 API 路由
@@ -78,6 +81,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/replay", h.handleReplay)
 	mux.HandleFunc("/api/traces", h.handleTraces)
 	mux.HandleFunc("/api/traces/", h.handleTraceDetail)
+	mux.HandleFunc("/api/archives", h.handleArchives)
+	mux.HandleFunc("/api/archives/", h.handleArchiveAction)
+	mux.HandleFunc("/api/archive-imports/", h.handleArchiveImportDelete)
 }
 
 // handleLogs 获取日志列表
@@ -96,12 +102,19 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 		h.jsonError(w, "使用 identity_id 筛选时必须指定 identity_upstream", http.StatusBadRequest)
 		return
 	}
-	filter := parseLogFilter(query, true)
+	filter, err := parseLogFilter(query, true)
+	if err != nil {
+		h.jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	logs, total, err := h.repo.ListLogs(filter)
 	if err != nil {
 		h.jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	for _, logEntry := range logs {
+		h.enrichLogArchiveState(logEntry)
 	}
 	h.prepareLogIdentities(logs)
 
@@ -113,7 +126,7 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func parseLogFilter(query url.Values, includePagination bool) storage.LogFilter {
+func parseLogFilter(query url.Values, includePagination bool) (storage.LogFilter, error) {
 	filter := storage.LogFilter{
 		Upstream:         query.Get("upstream"),
 		Method:           query.Get("method"),
@@ -125,6 +138,12 @@ func parseLogFilter(query url.Values, includePagination bool) storage.LogFilter 
 		IdentityID:       query.Get("identity_id"),
 		IdentityUpstream: query.Get("identity_upstream"),
 		IdentityTarget:   query.Get("identity_target"),
+		BackupStatus:     strings.TrimSpace(query.Get("backup_status")),
+	}
+	switch filter.BackupStatus {
+	case "", storage.BackupStatusPending, storage.BackupStatusVerified, storage.BackupStatusRestored:
+	default:
+		return storage.LogFilter{}, fmt.Errorf("backup_status 参数无效")
 	}
 	if saved := query.Get("saved"); saved != "" {
 		if v, err := strconv.ParseBool(saved); err == nil {
@@ -164,7 +183,7 @@ func parseLogFilter(query url.Values, includePagination bool) storage.LogFilter 
 		}
 	}
 
-	return filter
+	return filter, nil
 }
 
 func (h *Handler) handleLogsExport(w http.ResponseWriter, r *http.Request) {
@@ -201,14 +220,19 @@ func (h *Handler) handleLogsExport(w http.ResponseWriter, r *http.Request) {
 		includeBody = v
 	}
 
-	filter := parseLogFilter(query, false)
+	filter, err := parseLogFilter(query, false)
+	if err != nil {
+		h.jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename=\""+logsExportFilename(filter)+"\"")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 
 	encoder := json.NewEncoder(w)
 	flusher, _ := w.(http.Flusher)
-	err := h.repo.ExportLogs(r.Context(), filter, func(logEntry *storage.RequestLog) error {
+	err = h.repo.ExportLogs(r.Context(), filter, func(logEntry *storage.RequestLog) error {
+		h.enrichLogArchiveState(logEntry)
 		h.prepareLogIdentities([]*storage.RequestLog{logEntry})
 		if includeBody {
 			h.fillExportBodies(r.Context(), logEntry)
@@ -236,37 +260,42 @@ func (h *Handler) fillExportBodies(ctx context.Context, logEntry *storage.Reques
 	}
 
 	logging := h.cfg.LoggingSnapshot()
-	if logEntry.RequestBodyRef != "" {
-		if body, err := h.blobs.Get(ctx, logEntry.RequestBodyRef); err == nil {
-			formatted := httpbody.FormatForDisplay(
-				storage.FirstHeaderValue(logEntry.RequestHeaders, "Content-Type"),
-				storage.FirstHeaderValue(logEntry.RequestHeaders, "Content-Encoding"),
-				body,
-				httpbody.FormatOptions{
-					MaxOutputBytes:               logging.MaxRequestBody,
-					TrimLargeBase64:              !logging.StoreBase64,
-					RequireContentEncodingDecode: true,
-				},
-			)
+	for _, metadata := range logEntry.Bodies {
+		if metadata.BlobRef == "" {
+			continue
+		}
+		body, err := h.blobs.Get(ctx, metadata.BlobRef)
+		if err != nil {
+			logEntry.Truncated = true
+			continue
+		}
+		max := logging.MaxRequestBody
+		if metadata.Part == storage.BodyPartResponse {
+			max = logging.MaxResponseBody
+		}
+		formatOptions := httpbody.FormatOptions{
+			MaxOutputBytes:               max,
+			TrimLargeBase64:              !logging.StoreBase64,
+			RequireContentEncodingDecode: true,
+		}
+		var formatted httpbody.FormatResult
+		if metadata.Representation == "display" {
+			formatOptions.RequireContentEncodingDecode = false
+			formatted = httpbody.FormatPreviewForDisplay(metadata.ContentType, "", body, formatOptions)
+		} else {
+			formatted = httpbody.FormatForDisplay(metadata.ContentType, metadata.ContentEncoding, body, formatOptions)
+		}
+		switch metadata.Part {
+		case storage.BodyPartRequest:
 			logEntry.RequestBody = formatted.Text
-			logEntry.Truncated = logEntry.Truncated || formatted.Truncated
-		}
-	}
-	if logEntry.ResponseBodyRef != "" {
-		if body, err := h.blobs.Get(ctx, logEntry.ResponseBodyRef); err == nil {
-			formatted := httpbody.FormatForDisplay(
-				storage.FirstHeaderValue(logEntry.ResponseHeaders, "Content-Type"),
-				storage.FirstHeaderValue(logEntry.ResponseHeaders, "Content-Encoding"),
-				body,
-				httpbody.FormatOptions{
-					MaxOutputBytes:               logging.MaxResponseBody,
-					TrimLargeBase64:              !logging.StoreBase64,
-					RequireContentEncodingDecode: true,
-				},
-			)
+		case storage.BodyPartRequestOriginal:
+			logEntry.RequestBodyOriginal = formatted.Text
+		case storage.BodyPartRequestFinal:
+			logEntry.RequestBodyFinal = formatted.Text
+		case storage.BodyPartResponse:
 			logEntry.ResponseBody = formatted.Text
-			logEntry.Truncated = logEntry.Truncated || formatted.Truncated
 		}
+		logEntry.Truncated = logEntry.Truncated || metadata.Truncated || formatted.Truncated
 	}
 }
 
@@ -356,9 +385,25 @@ func (h *Handler) handleLogDetail(w http.ResponseWriter, r *http.Request) {
 		h.jsonError(w, "日志不存在", http.StatusNotFound)
 		return
 	}
+	h.enrichLogArchiveState(log)
 	h.prepareLogIdentities([]*storage.RequestLog{log})
 
 	h.jsonResponse(w, log)
+}
+
+func (h *Handler) enrichLogArchiveState(logEntry *storage.RequestLog) {
+	if logEntry == nil {
+		return
+	}
+	logEntry.DeleteEligibleAt = nil
+	if logEntry.Origin == "archive_import" || logEntry.BackupVerifiedAt == nil ||
+		logEntry.DeleteGraceStartedAt == nil || logEntry.Annotation.Saved {
+		return
+	}
+	eligibleAt := logEntry.DeleteGraceStartedAt.Add(
+		time.Duration(h.cfg.ArchiveSnapshot().LocalRetentionHours) * time.Hour,
+	)
+	logEntry.DeleteEligibleAt = &eligibleAt
 }
 
 func (h *Handler) handleLogBody(w http.ResponseWriter, r *http.Request, id string) {
@@ -367,8 +412,7 @@ func (h *Handler) handleLogBody(w http.ResponseWriter, r *http.Request, id strin
 		return
 	}
 
-	logEntry, err := h.repo.GetLog(id)
-	if err != nil {
+	if _, err := h.repo.GetLog(id); err != nil {
 		h.jsonError(w, "日志不存在", http.StatusNotFound)
 		return
 	}
@@ -378,53 +422,70 @@ func (h *Handler) handleLogBody(w http.ResponseWriter, r *http.Request, id strin
 		part = "response"
 	}
 
-	var body string
-	var ref string
-	var contentType string
-	var contentEncoding string
 	var maxOutputBytes int64
 
 	logging := h.cfg.LoggingSnapshot()
 	switch part {
-	case "request":
-		body = logEntry.RequestBody
-		ref = logEntry.RequestBodyRef
-		contentType = storage.FirstHeaderValue(logEntry.RequestHeaders, "Content-Type")
-		contentEncoding = storage.FirstHeaderValue(logEntry.RequestHeaders, "Content-Encoding")
+	case storage.BodyPartRequest, storage.BodyPartRequestOriginal, storage.BodyPartRequestFinal:
 		maxOutputBytes = logging.MaxRequestBody
-	case "response":
-		body = logEntry.ResponseBody
-		ref = logEntry.ResponseBodyRef
-		contentType = storage.FirstHeaderValue(logEntry.ResponseHeaders, "Content-Type")
-		contentEncoding = storage.FirstHeaderValue(logEntry.ResponseHeaders, "Content-Encoding")
+	case storage.BodyPartResponse:
 		maxOutputBytes = logging.MaxResponseBody
 	default:
 		h.jsonError(w, "不支持的 body part", http.StatusBadRequest)
 		return
 	}
 
-	if ref == "" || h.blobs == nil {
+	bodyRepo, ok := h.repo.(storage.BodyRepository)
+	if !ok {
+		h.jsonError(w, "正文元数据存储不可用", http.StatusNotImplemented)
+		return
+	}
+	metadata, err := bodyRepo.GetLogBody(id, part)
+	if err == sql.ErrNoRows {
 		h.jsonResponse(w, map[string]interface{}{
-			"body":      body,
-			"truncated": logEntry.Truncated,
+			"body":        "",
+			"part":        part,
+			"recoverable": false,
+		})
+		return
+	}
+	if err != nil {
+		h.jsonError(w, "读取正文元数据失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if metadata.BlobRef == "" || h.blobs == nil {
+		h.jsonResponse(w, map[string]interface{}{
+			"body":        "",
+			"metadata":    metadata,
+			"truncated":   true,
+			"recoverable": false,
 		})
 		return
 	}
 
-	data, err := h.blobs.Get(r.Context(), ref)
+	data, err := h.blobs.Get(r.Context(), metadata.BlobRef)
 	if err != nil {
 		h.jsonError(w, "读取 Blob 失败: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	formatted := httpbody.FormatForDisplay(contentType, contentEncoding, data, httpbody.FormatOptions{
+	formatOptions := httpbody.FormatOptions{
 		MaxOutputBytes:               maxOutputBytes,
 		TrimLargeBase64:              !logging.StoreBase64,
 		RequireContentEncodingDecode: true,
-	})
+	}
+	var formatted httpbody.FormatResult
+	if metadata.Representation == "display" {
+		formatOptions.RequireContentEncodingDecode = false
+		formatted = httpbody.FormatPreviewForDisplay(metadata.ContentType, "", data, formatOptions)
+	} else {
+		formatted = httpbody.FormatForDisplay(metadata.ContentType, metadata.ContentEncoding, data, formatOptions)
+	}
 	h.jsonResponse(w, map[string]interface{}{
 		"body":              formatted.Text,
-		"truncated":         logEntry.Truncated || formatted.Truncated,
+		"metadata":          metadata,
+		"truncated":         metadata.Truncated || formatted.Truncated,
+		"recoverable":       metadata.Recoverable,
 		"body_decoded":      formatted.Decoded,
 		"body_decoded_from": formatted.DecodedFrom,
 		"decode_failed":     formatted.DecodeFailed,
@@ -949,6 +1010,7 @@ func (h *Handler) handleConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		logging := h.cfg.LoggingSnapshot()
 		storageCfg := h.cfg.StorageSnapshot()
+		archiveCfg := h.cfg.ArchiveSnapshot()
 		serverCfg := h.cfg.ServerSnapshot()
 		overrides := h.cfg.RequestOverridesSnapshot()
 		usageExtraction := h.cfg.UsageExtractionSnapshot()
@@ -964,8 +1026,6 @@ func (h *Handler) handleConfig(w http.ResponseWriter, r *http.Request) {
 				"max_response_body":           logging.MaxResponseBody,
 				"sensitive_headers":           logging.SensitiveHeaders,
 				"early_request_body_snapshot": logging.EarlyRequestBodySnapshot,
-				"detach_body_over_bytes":      logging.DetachBodyOverBytes,
-				"body_preview_bytes":          logging.BodyPreviewBytes,
 				"store_base64":                logging.StoreBase64,
 			},
 			"storage": map[string]interface{}{
@@ -974,7 +1034,9 @@ func (h *Handler) handleConfig(w http.ResponseWriter, r *http.Request) {
 				"max_storage_bytes": storageCfg.MaxStorageBytes,
 				"blob_store":        storageCfg.BlobStore,
 				"blob_dir":          storageCfg.BlobDir,
+				"body_compression":  storageCfg.BodyCompression,
 			},
+			"archive":           publicArchiveConfig(archiveCfg),
 			"request_overrides": overrides,
 			"usage_extraction":  usageExtraction,
 			"identity_resolution": map[string]interface{}{
@@ -996,14 +1058,14 @@ func (h *Handler) handleConfig(w http.ResponseWriter, r *http.Request) {
 				MaxResponseBody  *int64    `json:"max_response_body"`
 				SensitiveHeaders *[]string `json:"sensitive_headers"`
 				EarlyReqSnapshot *bool     `json:"early_request_body_snapshot"`
-				DetachBodyOver   *int64    `json:"detach_body_over_bytes"`
-				BodyPreviewBytes *int64    `json:"body_preview_bytes"`
 				StoreBase64      *bool     `json:"store_base64"`
 			} `json:"logging"`
 			Storage *struct {
-				RetentionDays   *int   `json:"retention_days"`
-				MaxStorageBytes *int64 `json:"max_storage_bytes"`
+				RetentionDays   *int                          `json:"retention_days"`
+				MaxStorageBytes *int64                        `json:"max_storage_bytes"`
+				BodyCompression *config.BodyCompressionConfig `json:"body_compression"`
 			} `json:"storage"`
+			Archive            *archiveConfigUpdate           `json:"archive"`
 			RequestOverrides   *config.RequestOverridesConfig `json:"request_overrides"`
 			UsageExtraction    *config.UsageExtractionConfig  `json:"usage_extraction"`
 			IdentityResolution *struct {
@@ -1014,6 +1076,17 @@ func (h *Handler) handleConfig(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			h.jsonError(w, "无效的请求体", http.StatusBadRequest)
 			return
+		}
+
+		var archiveCandidate *config.ArchiveConfig
+		if req.Archive != nil {
+			candidate := mergeArchiveConfig(h.cfg.ArchiveSnapshot(), *req.Archive)
+			if err := config.ValidateArchiveConfig(candidate); err != nil {
+				h.jsonError(w, "无效的归档配置: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			candidate = config.NormalizeArchiveConfig(candidate)
+			archiveCandidate = &candidate
 		}
 
 		// 更新日志配置
@@ -1040,12 +1113,6 @@ func (h *Handler) handleConfig(w http.ResponseWriter, r *http.Request) {
 				if req.Logging.EarlyReqSnapshot != nil {
 					c.Logging.EarlyRequestBodySnapshot = *req.Logging.EarlyReqSnapshot
 				}
-				if req.Logging.DetachBodyOver != nil {
-					c.Logging.DetachBodyOverBytes = *req.Logging.DetachBodyOver
-				}
-				if req.Logging.BodyPreviewBytes != nil {
-					c.Logging.BodyPreviewBytes = *req.Logging.BodyPreviewBytes
-				}
 				if req.Logging.StoreBase64 != nil {
 					c.Logging.StoreBase64 = *req.Logging.StoreBase64
 				}
@@ -1058,6 +1125,13 @@ func (h *Handler) handleConfig(w http.ResponseWriter, r *http.Request) {
 				if req.Storage.MaxStorageBytes != nil {
 					c.Storage.MaxStorageBytes = *req.Storage.MaxStorageBytes
 				}
+				if req.Storage.BodyCompression != nil {
+					c.Storage.BodyCompression = *req.Storage.BodyCompression
+				}
+				c.Storage = config.NormalizeStorageConfig(c.Storage)
+			}
+			if archiveCandidate != nil {
+				c.Archive = *archiveCandidate
 			}
 
 			if req.RequestOverrides != nil {
@@ -1067,6 +1141,10 @@ func (h *Handler) handleConfig(w http.ResponseWriter, r *http.Request) {
 				c.Usage = config.NormalizeUsageExtraction(*req.UsageExtraction)
 			}
 		})
+		if fsStore, ok := h.blobs.(*storage.FileBlobStore); ok {
+			storageCfg := h.cfg.StorageSnapshot()
+			fsStore.SetCompression(storageCfg.BodyCompression.Algorithm, storageCfg.BodyCompression.Level)
+		}
 		if req.IdentityResolution != nil && req.IdentityResolution.Enabled != nil {
 			h.cfg.SetIdentityAuditEnabled(*req.IdentityResolution.Enabled)
 			if *req.IdentityResolution.Enabled {
