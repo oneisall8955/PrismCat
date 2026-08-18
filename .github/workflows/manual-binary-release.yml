@@ -4,17 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: '要补充文件的 Release 标签 (例如 v1.6.0)'
+        description: 'Release 标签；不存在时自动创建 (例如 v1.6.0)'
         required: true
         default: 'v1.14.0'
 
 jobs:
-  build-and-release:
+  build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # 必须有写入权限才能更新 Release
-    
+    env:
+      TAG_NAME: ${{ inputs.tag_name }}
+      ASSET_NAME: prismcat-${{ inputs.tag_name }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
+
     strategy:
+      fail-fast: false
       matrix:
         include:
           - goos: linux
@@ -30,6 +32,14 @@ jobs:
             suffix: .exe
 
     steps:
+      - name: 校验版本标签
+        shell: bash
+        run: |
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "版本标签必须符合 v0.0.1 或 v0.0.1-rc.1 格式" >&2
+            exit 1
+          fi
+
       - name: 检出代码
         uses: actions/checkout@v6
 
@@ -61,13 +71,47 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0 # 关键：关闭 CGO 使二进制文件在 Linux/macOS 上具备极致的便携性
         run: |
-          VERSION="${{ github.event.inputs.tag_name }}"
-          VERSION="${VERSION#v}"
-          ASSET_NAME="prismcat-${{ github.event.inputs.tag_name }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}"
+          VERSION="${TAG_NAME#v}"
           go build -ldflags="-s -w -X github.com/paopaoandlingyia/PrismCat/internal/config.Version=${VERSION}" -o "${ASSET_NAME}" ./cmd/prismcat
-          echo "ASSET_NAME=${ASSET_NAME}" >> "$GITHUB_ENV"
 
-      - name: 上传到现有的 Release
-        run: gh release upload "${{ github.event.inputs.tag_name }}" "${ASSET_NAME}" --clobber
+      - name: 保存编译产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET_NAME }}
+          path: ${{ env.ASSET_NAME }}
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-release:
+    name: 创建或更新 Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 下载全部编译产物
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: 创建 Release 或覆盖附件
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.event.inputs.tag_name }}
+        run: |
+          mapfile -t ASSETS < <(find release-assets -maxdepth 1 -type f -print | sort)
+          if [ "${#ASSETS[@]}" -eq 0 ]; then
+            echo "没有找到可发布的编译产物" >&2
+            exit 1
+          fi
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" "${ASSETS[@]}" --clobber
+          else
+            gh release create "$TAG_NAME" "${ASSETS[@]}" \
+              --target "$GITHUB_SHA" \
+              --title "$TAG_NAME" \
+              --generate-notes
+          fi
