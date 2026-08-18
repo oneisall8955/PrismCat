@@ -21,29 +21,36 @@ import (
 	"github.com/paopaoandlingyia/PrismCat/internal/storageusage"
 	"github.com/paopaoandlingyia/PrismCat/internal/systemmetrics"
 	"github.com/paopaoandlingyia/PrismCat/internal/updatecheck"
+	"github.com/paopaoandlingyia/PrismCat/internal/upstreamidentity"
 )
 
 // Handler API 处理器
 type Handler struct {
-	cfg     *config.Config
-	repo    storage.Repository
-	blobs   storage.BlobStore
-	live    *live.Registry
-	clients *outbound.ClientCache
-	metrics *systemmetrics.Collector
-	updates *updatecheck.Checker
+	cfg      *config.Config
+	repo     storage.Repository
+	blobs    storage.BlobStore
+	live     *live.Registry
+	clients  *outbound.ClientCache
+	metrics  *systemmetrics.Collector
+	updates  *updatecheck.Checker
+	identity *upstreamidentity.Manager
 }
 
 // New 创建 API 处理器
-func New(cfg *config.Config, repo storage.Repository, blobs storage.BlobStore, liveRegistry *live.Registry) *Handler {
+func New(cfg *config.Config, repo storage.Repository, blobs storage.BlobStore, liveRegistry *live.Registry, identityManagers ...*upstreamidentity.Manager) *Handler {
+	var identityManager *upstreamidentity.Manager
+	if len(identityManagers) > 0 {
+		identityManager = identityManagers[0]
+	}
 	return &Handler{
-		cfg:     cfg,
-		repo:    repo,
-		blobs:   blobs,
-		live:    liveRegistry,
-		clients: outbound.NewClientCache(50, 10),
-		metrics: systemmetrics.NewCollector(),
-		updates: updatecheck.NewChecker(),
+		cfg:      cfg,
+		repo:     repo,
+		blobs:    blobs,
+		live:     liveRegistry,
+		clients:  outbound.NewClientCache(50, 10),
+		metrics:  systemmetrics.NewCollector(),
+		updates:  updatecheck.NewChecker(),
+		identity: identityManager,
 	}
 }
 
@@ -55,6 +62,10 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/stats", h.handleStats)
 	mux.HandleFunc("/api/upstreams", h.handleUpstreams)
 	mux.HandleFunc("/api/upstreams/active-target", h.handleUpstreamActiveTarget)
+	mux.HandleFunc("/api/upstreams/identity-test", h.handleUpstreamIdentityTest)
+	mux.HandleFunc("/api/upstreams/identity-sync", h.handleUpstreamIdentitySync)
+	mux.HandleFunc("/api/upstream-identities", h.handleUpstreamIdentities)
+	mux.HandleFunc("/api/upstream-identities/resolve-pending", h.handlePendingIdentityResolution)
 	mux.HandleFunc("/api/logging-rules/model-path-templates", h.handleModelPathTemplates)
 	mux.HandleFunc("/api/logging-rules/ignored-paths", h.handleIgnoredPaths)
 	mux.HandleFunc("/api/config", h.handleConfig)
@@ -77,6 +88,14 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := r.URL.Query()
+	if !h.cfg.IdentityAuditEnabled() && (strings.TrimSpace(query.Get("identity_id")) != "" || strings.TrimSpace(query.Get("identity_upstream")) != "" || strings.TrimSpace(query.Get("identity_target")) != "") {
+		h.jsonError(w, "上游身份审计未启用", http.StatusConflict)
+		return
+	}
+	if strings.TrimSpace(query.Get("identity_id")) != "" && strings.TrimSpace(query.Get("identity_upstream")) == "" {
+		h.jsonError(w, "使用 identity_id 筛选时必须指定 identity_upstream", http.StatusBadRequest)
+		return
+	}
 	filter := parseLogFilter(query, true)
 
 	logs, total, err := h.repo.ListLogs(filter)
@@ -84,6 +103,7 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 		h.jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	h.prepareLogIdentities(logs)
 
 	h.jsonResponse(w, map[string]interface{}{
 		"logs":   logs,
@@ -95,13 +115,16 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 
 func parseLogFilter(query url.Values, includePagination bool) storage.LogFilter {
 	filter := storage.LogFilter{
-		Upstream: query.Get("upstream"),
-		Method:   query.Get("method"),
-		Path:     query.Get("path"),
-		Tag:      query.Get("tag"),
-		TraceID:  query.Get("trace_id"),
-		Status:   query.Get("annotation_status"),
-		Label:    query.Get("annotation_label"),
+		Upstream:         query.Get("upstream"),
+		Method:           query.Get("method"),
+		Path:             query.Get("path"),
+		Tag:              query.Get("tag"),
+		TraceID:          query.Get("trace_id"),
+		Status:           query.Get("annotation_status"),
+		Label:            query.Get("annotation_label"),
+		IdentityID:       query.Get("identity_id"),
+		IdentityUpstream: query.Get("identity_upstream"),
+		IdentityTarget:   query.Get("identity_target"),
 	}
 	if saved := query.Get("saved"); saved != "" {
 		if v, err := strconv.ParseBool(saved); err == nil {
@@ -151,6 +174,14 @@ func (h *Handler) handleLogsExport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := r.URL.Query()
+	if !h.cfg.IdentityAuditEnabled() && (strings.TrimSpace(query.Get("identity_id")) != "" || strings.TrimSpace(query.Get("identity_upstream")) != "" || strings.TrimSpace(query.Get("identity_target")) != "") {
+		h.jsonError(w, "上游身份审计未启用", http.StatusConflict)
+		return
+	}
+	if strings.TrimSpace(query.Get("identity_id")) != "" && strings.TrimSpace(query.Get("identity_upstream")) == "" {
+		h.jsonError(w, "使用 identity_id 筛选时必须指定 identity_upstream", http.StatusBadRequest)
+		return
+	}
 	format := strings.ToLower(strings.TrimSpace(query.Get("format")))
 	if format == "" {
 		format = "jsonl"
@@ -178,6 +209,7 @@ func (h *Handler) handleLogsExport(w http.ResponseWriter, r *http.Request) {
 	encoder := json.NewEncoder(w)
 	flusher, _ := w.(http.Flusher)
 	err := h.repo.ExportLogs(r.Context(), filter, func(logEntry *storage.RequestLog) error {
+		h.prepareLogIdentities([]*storage.RequestLog{logEntry})
 		if includeBody {
 			h.fillExportBodies(r.Context(), logEntry)
 		} else {
@@ -235,6 +267,22 @@ func (h *Handler) fillExportBodies(ctx context.Context, logEntry *storage.Reques
 			logEntry.ResponseBody = formatted.Text
 			logEntry.Truncated = logEntry.Truncated || formatted.Truncated
 		}
+	}
+}
+
+func (h *Handler) prepareLogIdentities(logs []*storage.RequestLog) {
+	if h.cfg.IdentityAuditEnabled() {
+		if h.identity != nil {
+			h.identity.EnrichLogs(logs)
+		}
+		return
+	}
+	for _, logEntry := range logs {
+		if logEntry == nil {
+			continue
+		}
+		logEntry.UpstreamIdentityID = ""
+		logEntry.UpstreamIdentityLabel = ""
 	}
 }
 
@@ -308,6 +356,7 @@ func (h *Handler) handleLogDetail(w http.ResponseWriter, r *http.Request) {
 		h.jsonError(w, "日志不存在", http.StatusNotFound)
 		return
 	}
+	h.prepareLogIdentities([]*storage.RequestLog{log})
 
 	h.jsonResponse(w, log)
 }
@@ -585,6 +634,7 @@ func (h *Handler) handleTraceDetail(w http.ResponseWriter, r *http.Request) {
 		h.jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	h.prepareLogIdentities(requests)
 	if len(requests) == 0 {
 		h.jsonError(w, "trace 不存在", http.StatusNotFound)
 		return
@@ -697,8 +747,9 @@ func (h *Handler) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 				"outbound_proxy":                   resolved.OutboundProxy,
 				"logging_enabled":                  !upCfg.LoggingDisabled,
 				"logging_path_filter":              upCfg.LoggingPathFilter,
+				"identity_resolution":              identityForAPI(upCfg.IdentityResolution),
 				"active_target":                    upCfg.ActiveTarget,
-				"targets":                          upCfg.Targets,
+				"targets":                          targetsForAPI(upCfg.Targets),
 			})
 		}
 		sort.Slice(upstreams, func(i, j int) bool {
@@ -716,18 +767,19 @@ func (h *Handler) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 	// POST: 添加/更新
 	if r.Method == http.MethodPost {
 		var req struct {
-			Name                         string                                 `json:"name"`
-			Target                       string                                 `json:"target"`
-			Timeout                      int                                    `json:"timeout"`
-			ResponseHeaderTimeout        int                                    `json:"response_header_timeout"`
-			ResponseBodyFirstByteTimeout int                                    `json:"response_body_first_byte_timeout"`
-			ResponseBodyIdleTimeout      int                                    `json:"response_body_idle_timeout"`
-			Order                        int                                    `json:"order"`
-			OutboundProxy                string                                 `json:"outbound_proxy"`
-			LoggingEnabled               *bool                                  `json:"logging_enabled"`
-			LoggingPathFilter            *config.LoggingPathFilterConfig        `json:"logging_path_filter"`
-			ActiveTarget                 string                                 `json:"active_target"`
-			Targets                      map[string]config.UpstreamTargetConfig `json:"targets"`
+			Name                         string                          `json:"name"`
+			Target                       string                          `json:"target"`
+			Timeout                      int                             `json:"timeout"`
+			ResponseHeaderTimeout        int                             `json:"response_header_timeout"`
+			ResponseBodyFirstByteTimeout int                             `json:"response_body_first_byte_timeout"`
+			ResponseBodyIdleTimeout      int                             `json:"response_body_idle_timeout"`
+			Order                        int                             `json:"order"`
+			OutboundProxy                string                          `json:"outbound_proxy"`
+			LoggingEnabled               *bool                           `json:"logging_enabled"`
+			LoggingPathFilter            *config.LoggingPathFilterConfig `json:"logging_path_filter"`
+			ActiveTarget                 string                          `json:"active_target"`
+			Targets                      map[string]upstreamTargetAPI    `json:"targets"`
+			IdentityResolution           *identityResolutionAPI          `json:"identity_resolution"`
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -741,9 +793,11 @@ func (h *Handler) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 
 		loggingDisabled := false
 		var loggingPathFilter *config.LoggingPathFilterConfig
-		if current, ok := h.cfg.GetUpstream(req.Name); ok {
-			loggingDisabled = current.LoggingDisabled
-			loggingPathFilter = current.LoggingPathFilter
+		var current *config.UpstreamConfig
+		if existing, ok := h.cfg.GetUpstream(req.Name); ok {
+			current = existing
+			loggingDisabled = existing.LoggingDisabled
+			loggingPathFilter = existing.LoggingPathFilter
 		}
 		if req.LoggingEnabled != nil {
 			loggingDisabled = !*req.LoggingEnabled
@@ -752,6 +806,12 @@ func (h *Handler) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 			loggingPathFilter = req.LoggingPathFilter
 		}
 
+		var currentIdentity *config.IdentityResolutionConfig
+		var currentTargets map[string]config.UpstreamTargetConfig
+		if current != nil {
+			currentIdentity = current.IdentityResolution
+			currentTargets = current.Targets
+		}
 		err := h.cfg.AddUpstream(req.Name, config.UpstreamConfig{
 			Target:                       req.Target,
 			Timeout:                      req.Timeout,
@@ -762,8 +822,9 @@ func (h *Handler) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 			OutboundProxy:                req.OutboundProxy,
 			LoggingDisabled:              loggingDisabled,
 			LoggingPathFilter:            loggingPathFilter,
+			IdentityResolution:           identityFromAPI(req.IdentityResolution, currentIdentity),
 			ActiveTarget:                 req.ActiveTarget,
-			Targets:                      req.Targets,
+			Targets:                      targetsFromAPI(req.Targets, currentTargets),
 		})
 		if err != nil {
 			h.jsonError(w, err.Error(), http.StatusBadRequest)
@@ -772,6 +833,12 @@ func (h *Handler) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 		if err := h.cfg.Save(); err != nil {
 			h.jsonError(w, "保存配置失败: "+err.Error(), http.StatusInternalServerError)
 			return
+		}
+		if h.identity != nil {
+			if err := h.identity.ReloadConfig(); err != nil {
+				h.jsonError(w, "重新加载身份关联配置失败: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
 		}
 		h.jsonResponse(w, map[string]string{"status": "ok"})
 		return
@@ -791,6 +858,9 @@ func (h *Handler) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 		if err := h.cfg.Save(); err != nil {
 			h.jsonError(w, "保存配置失败: "+err.Error(), http.StatusInternalServerError)
 			return
+		}
+		if h.identity != nil {
+			_ = h.identity.ReloadConfig()
 		}
 		h.jsonResponse(w, map[string]string{"status": "ok"})
 		return
@@ -820,6 +890,9 @@ func (h *Handler) handleUpstreamActiveTarget(w http.ResponseWriter, r *http.Requ
 	if err := h.cfg.ActivateUpstreamTarget(req.Upstream, req.Target); err != nil {
 		h.jsonError(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+	if h.identity != nil {
+		_ = h.identity.ReloadConfig()
 	}
 	h.jsonResponse(w, map[string]string{"status": "ok", "active_target": strings.ToLower(strings.TrimSpace(req.Target))})
 }
@@ -904,6 +977,9 @@ func (h *Handler) handleConfig(w http.ResponseWriter, r *http.Request) {
 			},
 			"request_overrides": overrides,
 			"usage_extraction":  usageExtraction,
+			"identity_resolution": map[string]interface{}{
+				"enabled": h.cfg.IdentityAuditEnabled(),
+			},
 		})
 		return
 	}
@@ -928,8 +1004,11 @@ func (h *Handler) handleConfig(w http.ResponseWriter, r *http.Request) {
 				RetentionDays   *int   `json:"retention_days"`
 				MaxStorageBytes *int64 `json:"max_storage_bytes"`
 			} `json:"storage"`
-			RequestOverrides *config.RequestOverridesConfig `json:"request_overrides"`
-			UsageExtraction  *config.UsageExtractionConfig  `json:"usage_extraction"`
+			RequestOverrides   *config.RequestOverridesConfig `json:"request_overrides"`
+			UsageExtraction    *config.UsageExtractionConfig  `json:"usage_extraction"`
+			IdentityResolution *struct {
+				Enabled *bool `json:"enabled"`
+			} `json:"identity_resolution"`
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -988,11 +1067,26 @@ func (h *Handler) handleConfig(w http.ResponseWriter, r *http.Request) {
 				c.Usage = config.NormalizeUsageExtraction(*req.UsageExtraction)
 			}
 		})
+		if req.IdentityResolution != nil && req.IdentityResolution.Enabled != nil {
+			h.cfg.SetIdentityAuditEnabled(*req.IdentityResolution.Enabled)
+			if *req.IdentityResolution.Enabled {
+				if err := h.cfg.EnsureIdentityFingerprintSecretInitialized(); err != nil {
+					h.jsonError(w, "启用身份审计失败: "+err.Error(), http.StatusInternalServerError)
+					return
+				}
+			}
+		}
 
 		// 保存配置
 		if err := h.cfg.Save(); err != nil {
 			h.jsonError(w, "保存配置失败: "+err.Error(), http.StatusInternalServerError)
 			return
+		}
+		if h.identity != nil {
+			if err := h.identity.ReloadConfig(); err != nil {
+				h.jsonError(w, "重新加载身份审计配置失败: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
 		}
 		h.jsonResponse(w, map[string]string{"status": "ok"})
 		return

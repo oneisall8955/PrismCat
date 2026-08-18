@@ -1,5 +1,5 @@
 import { Suspense, lazy, startTransition, useEffect, useMemo, useState, useCallback, useRef } from 'react'
-import { buildLogsExportUrl, fetchLogs, fetchLog, fetchStats, fetchUpstreams } from '@/lib/api'
+import { buildLogsExportUrl, fetchConfig, fetchLogs, fetchLog, fetchStats, fetchUpstreams } from '@/lib/api'
 import type { RequestLog, LogStats, Upstream, LogFilter, LogListResponse } from '@/lib/api'
 import { StatsCards } from '@/components/StatsCards'
 import { LogTable } from '@/components/LogTable'
@@ -18,6 +18,7 @@ export function Dashboard() {
     const [logs, setLogs] = useState<RequestLog[]>([])
     const [stats, setStats] = useState<LogStats | null>(null)
     const [upstreams, setUpstreams] = useState<Upstream[]>([])
+    const [identityAuditEnabled, setIdentityAuditEnabled] = useState(false)
     const [total, setTotal] = useState(0)
     const [loading, setLoading] = useState(true)
     const [selectedLog, setSelectedLog] = useState<RequestLog | null>(null)
@@ -52,8 +53,9 @@ export function Dashboard() {
     // 加载上游配置
     const loadUpstreams = useCallback(async () => {
         try {
-            const data = await fetchUpstreams()
+            const [data, appConfig] = await Promise.all([fetchUpstreams(), fetchConfig()])
             setUpstreams(data || [])
+            setIdentityAuditEnabled(appConfig.identity_resolution?.enabled ?? false)
         } catch (err) {
             console.error('[Dashboard] Failed to load upstreams:', err)
         }
@@ -149,6 +151,8 @@ export function Dashboard() {
                         upstreams={upstreams}
                         total={total}
                         loading={loading}
+                        identityAuditEnabled={identityAuditEnabled}
+                        onIdentityResolutionComplete={loadLogs}
                     />
                 </div>
 
@@ -158,6 +162,7 @@ export function Dashboard() {
                     loading={loading}
                     onSelect={handleSelectLog}
                     selectedId={selectedLog?.id}
+                    identityAuditEnabled={identityAuditEnabled}
                 />
             </section>
 
@@ -171,6 +176,7 @@ export function Dashboard() {
                     onNavigateLog={handleNavigateLog}
                     canNavigatePreviousLog={selectedLogIndex > 0}
                     canNavigateNextLog={selectedLogIndex >= 0 && selectedLogIndex < logs.length - 1}
+                    identityAuditEnabled={identityAuditEnabled}
                 />
             </Suspense>
         </div>

@@ -32,6 +32,7 @@ interface LogDetailProps {
     onNavigateLog?: (direction: LogNavigationDirection) => void
     canNavigatePreviousLog?: boolean
     canNavigateNextLog?: boolean
+    identityAuditEnabled?: boolean
 }
 
 type LogNavigationDirection = 'previous' | 'next'
@@ -218,6 +219,7 @@ export function LogDetail({
     onNavigateLog,
     canNavigatePreviousLog = false,
     canNavigateNextLog = false,
+    identityAuditEnabled = false,
 }: LogDetailProps) {
     const { t, i18n } = useTranslation()
     const navigate = useNavigate()
@@ -1036,6 +1038,26 @@ export function LogDetail({
                                 </code>
                                 <CopyButton text={displayLog.target_url} field="url" className={hoverCopyClassName} />
                             </dd>
+
+                            {identityAuditEnabled && displayLog.upstream_identity_id && (
+                                <>
+                                    <OverviewLabel>{t('log_detail.identity_source')}</OverviewLabel>
+                                    <dd className="min-w-0 break-all font-mono text-foreground">
+                                        {displayLog.upstream}{displayLog.upstream_target ? ` / ${displayLog.upstream_target}` : ''}
+                                    </dd>
+                                    <OverviewLabel>{t('log_detail.identity_name')}</OverviewLabel>
+                                    <dd className="min-w-0 break-all text-foreground">
+                                        {displayLog.upstream_identity_label || displayLog.upstream_identity_id}
+                                    </dd>
+                                    <OverviewLabel>{t('log_detail.identity_id')}</OverviewLabel>
+                                    <dd className="group/copy flex min-w-0 items-baseline gap-1">
+                                        <code className="min-w-0 break-all font-mono text-foreground">
+                                            {displayLog.upstream_identity_id}
+                                        </code>
+                                        <CopyButton text={displayLog.upstream_identity_id} field="identity-id" className={hoverCopyClassName} />
+                                    </dd>
+                                </>
+                            )}
 
                             {/* UUID 固定 36 字符,放在头部身份行会比 8 字符截断宽 179px,
                                 窄窗口必然换行;而它的价值只在"能被复制",不在"能被读" */}

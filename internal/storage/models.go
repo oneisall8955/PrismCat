@@ -13,9 +13,11 @@ type RequestLog struct {
 	CreatedAt time.Time `json:"created_at"`
 
 	// 上游信息
-	Upstream       string `json:"upstream"`                  // 上游名称 (openai, gemini 等)
-	UpstreamTarget string `json:"upstream_target,omitempty"` // 请求开始时选中的目标预设
-	TargetURL      string `json:"target_url"`                // 实际请求的上游 URL
+	Upstream              string `json:"upstream"`                  // 上游名称 (openai, gemini 等)
+	UpstreamTarget        string `json:"upstream_target,omitempty"` // 请求开始时选中的目标预设
+	TargetURL             string `json:"target_url"`                // 实际请求的上游 URL
+	UpstreamIdentityID    string `json:"upstream_identity_id,omitempty"`
+	UpstreamIdentityLabel string `json:"upstream_identity_label,omitempty"`
 
 	// 请求信息
 	Method              string              `json:"method"`
@@ -64,6 +66,8 @@ type RequestLog struct {
 	RequestBodyCaptureTruncated  bool   `json:"-"`
 	ResponseBodyRaw              []byte `json:"-"`
 	ResponseBodyCaptureTruncated bool   `json:"-"`
+	APIKeyFingerprint            string `json:"-"`
+	IdentityResolutionReady      bool   `json:"-"`
 }
 
 type LogAnnotation struct {
@@ -77,23 +81,40 @@ type LogAnnotation struct {
 
 // LogFilter 日志查询过滤器
 type LogFilter struct {
-	Upstream   string     // 按上游名称过滤
-	Method     string     // 按请求方法过滤
-	StatusCode int        // 按状态码过滤
-	Path       string     // 按路径模糊搜索
-	Tag        string     // 按标签过滤
-	TraceID    string     // 按 trace ID 过滤
-	Saved      *bool      // 是否保存
-	Status     string     // 人工处理状态：none/todo/done
-	Label      string     // 按人工标签过滤
-	StartTime  *time.Time // 开始时间
-	EndTime    *time.Time // 结束时间
-	HasError   *bool      // 是否有错误
-	Streaming  *bool      // 是否为流式
+	Upstream         string     // 按上游名称过滤
+	Method           string     // 按请求方法过滤
+	StatusCode       int        // 按状态码过滤
+	Path             string     // 按路径模糊搜索
+	Tag              string     // 按标签过滤
+	TraceID          string     // 按 trace ID 过滤
+	Saved            *bool      // 是否保存
+	Status           string     // 人工处理状态：none/todo/done
+	Label            string     // 按人工标签过滤
+	StartTime        *time.Time // 开始时间
+	EndTime          *time.Time // 结束时间
+	HasError         *bool      // 是否有错误
+	Streaming        *bool      // 是否为流式
+	IdentityID       string     // 上游身份 ID
+	IdentityUpstream string     // 身份所属 upstream
+	IdentityTarget   string     // 身份所属 target preset
 
 	// 分页
 	Offset int
 	Limit  int
+}
+
+type PendingIdentityLog struct {
+	ID             string
+	Upstream       string
+	UpstreamTarget string
+	Fingerprint    string
+	CreatedAtMS    int64
+}
+
+type IdentityRepository interface {
+	SetLogIdentityIfEmpty(logID, identityID string) (bool, error)
+	ListPendingIdentityLogs(upstream, target, directoryVersion string, afterMS int64, afterID string, limit int) ([]PendingIdentityLog, error)
+	MarkLogsIdentityResolutionVersion(logIDs []string, directoryVersion string) error
 }
 
 // LogStats 日志统计

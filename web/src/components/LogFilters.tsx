@@ -1,8 +1,10 @@
 import { cn } from '@/lib/utils'
-import { Search, RotateCcw, ChevronDown, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Download, SlidersHorizontal } from 'lucide-react'
-import type { Upstream, LogFilter } from '@/lib/api'
-import { Suspense, lazy, useEffect, useState } from 'react'
+import { Search, RotateCcw, ChevronDown, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Download, SlidersHorizontal, RefreshCw, X } from 'lucide-react'
+import { fetchUpstreamIdentities, resolvePendingUpstreamIdentities } from '@/lib/api'
+import type { Upstream, UpstreamIdentity, IdentitySourceStatus, LogFilter } from '@/lib/api'
+import { Suspense, lazy, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
 import {
@@ -13,6 +15,14 @@ import {
     SelectValue,
 } from "@/components/ui/select"
 import { Badge } from "@/components/ui/badge"
+import {
+    Table,
+    TableBody,
+    TableCell,
+    TableHead,
+    TableHeader,
+    TableRow,
+} from "@/components/ui/table"
 import {
     Tooltip,
     TooltipContent,
@@ -27,9 +37,12 @@ interface LogFiltersProps {
     upstreams: Upstream[]
     total: number
     loading?: boolean
+    identityAuditEnabled: boolean
+    onIdentityResolutionComplete?: () => void
 }
 
 const DEFAULT_FILTER: LogFilter = { limit: 20, offset: 0 }
+const IDENTITY_PAGE_SIZE = 5
 
 const DateRangePicker = lazy(async () => {
     const module = await import('./DateRangePicker')
@@ -53,8 +66,22 @@ export function LogFilters({
     upstreams,
     total,
     loading,
+    identityAuditEnabled,
+    onIdentityResolutionComplete,
 }: LogFiltersProps) {
     const { t } = useTranslation()
+    const [identityOptions, setIdentityOptions] = useState<UpstreamIdentity[]>([])
+    const [identitySources, setIdentitySources] = useState<IdentitySourceStatus[]>([])
+    const [identityQuery, setIdentityQuery] = useState('')
+    const [identityPage, setIdentityPage] = useState(1)
+    const [identityTotal, setIdentityTotal] = useState(0)
+    const [identityLoading, setIdentityLoading] = useState(false)
+    const [identityError, setIdentityError] = useState('')
+    const [selectedIdentity, setSelectedIdentity] = useState<UpstreamIdentity | null>(null)
+    const [identityOpen, setIdentityOpen] = useState(false)
+    const [resolutionRequesting, setResolutionRequesting] = useState(false)
+    const resolutionWasActive = useRef(false)
+    const identityPickerRef = useRef<HTMLDivElement>(null)
 
     // 本地暂存的筛选条件（不触发查询）
     const [draftState, setDraftState] = useState(() => ({
@@ -78,6 +105,73 @@ export function LogFilters({
         }))
     }
 
+    const identityUpstream = identityAuditEnabled ? (draft.upstream?.trim() || '') : ''
+    const identityOffset = (identityPage - 1) * IDENTITY_PAGE_SIZE
+    const identityTotalPages = Math.max(1, Math.ceil(identityTotal / IDENTITY_PAGE_SIZE))
+
+    useEffect(() => {
+        if (!identityOpen) return
+        const closeOnOutsideClick = (event: PointerEvent) => {
+            if (!identityPickerRef.current?.contains(event.target as Node)) setIdentityOpen(false)
+        }
+        const closeOnEscape = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') setIdentityOpen(false)
+        }
+        document.addEventListener('pointerdown', closeOnOutsideClick)
+        document.addEventListener('keydown', closeOnEscape)
+        return () => {
+            document.removeEventListener('pointerdown', closeOnOutsideClick)
+            document.removeEventListener('keydown', closeOnEscape)
+        }
+    }, [identityOpen])
+
+    useEffect(() => {
+        if (!identityUpstream) {
+            setIdentityOpen(false)
+            setIdentityOptions([])
+            setIdentitySources([])
+            setIdentityTotal(0)
+            setIdentityLoading(false)
+            setIdentityError('')
+            return
+        }
+        const controller = new AbortController()
+        const timer = window.setTimeout(() => {
+            setIdentityLoading(true)
+            setIdentityError('')
+            fetchUpstreamIdentities({
+                upstream: identityUpstream,
+                query: identityQuery.trim(),
+                offset: identityOffset,
+                limit: IDENTITY_PAGE_SIZE,
+            })
+                .then(response => {
+                    if (!controller.signal.aborted) {
+                        setIdentityOptions(response.items || [])
+                        setIdentitySources(response.sources || [])
+                        setIdentityTotal(response.total || 0)
+                        const lastPage = Math.max(1, Math.ceil((response.total || 0) / IDENTITY_PAGE_SIZE))
+                        if (identityPage > lastPage) setIdentityPage(lastPage)
+                    }
+                })
+                .catch((error: unknown) => {
+                    if (!controller.signal.aborted) {
+                        setIdentityOptions([])
+                        setIdentitySources([])
+                        setIdentityTotal(0)
+                        setIdentityError(error instanceof Error ? error.message : t('filters.identity_load_failed'))
+                    }
+                })
+                .finally(() => {
+                    if (!controller.signal.aborted) setIdentityLoading(false)
+                })
+        }, 250)
+        return () => {
+            controller.abort()
+            window.clearTimeout(timer)
+        }
+    }, [identityAuditEnabled, identityOffset, identityPage, identityQuery, identityUpstream, t])
+
     // 提交查询
     const handleSearch = () => {
         onSearch({ ...draft, offset: 0 })
@@ -86,6 +180,11 @@ export function LogFilters({
     // 重置所有条件并立即触发查询
     const handleReset = () => {
         const resetFilter = { ...DEFAULT_FILTER }
+        setIdentityQuery('')
+        setIdentityPage(1)
+        setIdentityTotal(0)
+        setSelectedIdentity(null)
+        setIdentityOpen(false)
         setDraft(resetFilter)
         onSearch(resetFilter)
     }
@@ -128,15 +227,93 @@ export function LogFilters({
     const isSavedChanged = (draft.saved ?? undefined) !== (filter.saved ?? undefined)
     const isAnnotationStatusChanged = (draft.annotation_status || '') !== (filter.annotation_status || '')
     const isAnnotationLabelChanged = (draft.annotation_label || '') !== (filter.annotation_label || '')
+    const isIdentityChanged = (draft.identity_id || '') !== (filter.identity_id || '') ||
+        (draft.identity_upstream || '') !== (filter.identity_upstream || '') ||
+        (draft.identity_target || '') !== (filter.identity_target || '')
     const isTimeChanged = (draft.start_time || '') !== (filter.start_time || '') ||
         (draft.end_time || '') !== (filter.end_time || '')
     const hasChanges = isPathChanged || isUpstreamChanged || isMethodChanged || isStatusCodeChanged || isTraceIdChanged || isTagChanged ||
-        isSavedChanged || isAnnotationStatusChanged || isAnnotationLabelChanged || isTimeChanged
+        isSavedChanged || isAnnotationStatusChanged || isAnnotationLabelChanged || isIdentityChanged || isTimeChanged
+
+    const requestedIdentityUpstream = draft.identity_upstream || draft.upstream || ''
+    const requestedIdentityTarget = draft.identity_target || ''
+    const resolutionCandidates = identitySources.filter(source =>
+        (!requestedIdentityUpstream || source.upstream === requestedIdentityUpstream) &&
+        (!requestedIdentityTarget || source.target === requestedIdentityTarget),
+    )
+    const resolutionSource = resolutionCandidates.length === 1 ? resolutionCandidates[0] : undefined
+    const resolutionActive = Boolean(resolutionSource?.resolution_queued || resolutionSource?.resolving_logs)
+
+    useEffect(() => {
+        if (!resolutionActive || !identityUpstream) return
+        const timer = window.setInterval(() => {
+            fetchUpstreamIdentities({
+                upstream: identityUpstream,
+                query: identityQuery.trim(),
+                offset: identityOffset,
+                limit: IDENTITY_PAGE_SIZE,
+            })
+                .then(response => {
+                    setIdentityOptions(response.items || [])
+                    setIdentitySources(response.sources || [])
+                    setIdentityTotal(response.total || 0)
+                })
+                .catch(() => undefined)
+        }, 1000)
+        return () => window.clearInterval(timer)
+    }, [identityOffset, identityQuery, identityUpstream, resolutionActive])
+
+    useEffect(() => {
+        if (resolutionWasActive.current && !resolutionActive && resolutionSource?.last_resolution_at) {
+            if (resolutionSource.resolution_error) {
+                toast.error(t('filters.identity_resolution_failed', { error: resolutionSource.resolution_error }))
+            } else {
+                toast.success(t('filters.identity_resolution_complete', {
+                    resolved: resolutionSource.resolved_logs,
+                    unmatched: resolutionSource.unmatched_logs,
+                }))
+                onIdentityResolutionComplete?.()
+            }
+        }
+        resolutionWasActive.current = resolutionActive
+    }, [onIdentityResolutionComplete, resolutionActive, resolutionSource, t])
+
+    const handleResolvePendingIdentities = async () => {
+        if (!resolutionSource) {
+            setShowAdvanced(true)
+            toast.info(t('filters.identity_resolution_select_source'))
+            return
+        }
+        setResolutionRequesting(true)
+        try {
+            const status = await resolvePendingUpstreamIdentities(resolutionSource.upstream, resolutionSource.target)
+            setIdentitySources(current => current.map(source =>
+                source.upstream === status.upstream && source.target === status.target ? status : source,
+            ))
+            toast.success(t('filters.identity_resolution_queued'))
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : t('filters.identity_resolution_failed', { error: '' }))
+        } finally {
+            setResolutionRequesting(false)
+        }
+    }
+
+    const resolutionTooltip = !resolutionSource
+        ? t('filters.identity_resolution_select_source')
+        : resolutionActive
+            ? t('filters.identity_resolution_running')
+            : resolutionSource.last_resolution_at
+                ? t('filters.identity_resolution_summary', {
+                    resolved: resolutionSource.resolved_logs,
+                    unmatched: resolutionSource.unmatched_logs,
+                })
+                : t('filters.identity_resolution_action')
 
     // 次级筛选默认收起,但只要有生效的条件就展开,避免"筛了却看不见"
     const activeAdvancedCount = [
         draft.upstream, draft.method, draft.status_code, draft.tag,
         draft.saved, draft.annotation_status, draft.annotation_label,
+        identityAuditEnabled ? draft.identity_id : undefined,
     ].filter(value => value !== undefined && value !== '').length
     const [showAdvanced, setShowAdvanced] = useState(activeAdvancedCount > 0)
 
@@ -231,6 +408,23 @@ export function LogFilters({
                             </Tooltip>
                         )}
 
+                        {identityAuditEnabled && <Tooltip>
+                            <TooltipTrigger asChild>
+                                <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="icon"
+                                    className="h-8 w-8 shrink-0 border border-input bg-background text-muted-foreground hover:bg-accent hover:text-foreground"
+                                    disabled={!resolutionSource || resolutionRequesting || resolutionActive}
+                                    onClick={handleResolvePendingIdentities}
+                                    aria-label={t('filters.identity_resolution_action')}
+                                >
+                                    <RefreshCw className={cn('h-4 w-4', (resolutionRequesting || resolutionActive) && 'animate-spin')} />
+                                </Button>
+                            </TooltipTrigger>
+                            <TooltipContent><p>{resolutionTooltip}</p></TooltipContent>
+                        </Tooltip>}
+
                         <Tooltip>
                             <TooltipTrigger asChild>
                                 <Button
@@ -251,10 +445,25 @@ export function LogFilters({
             </div>
 
             {showAdvanced && (
+                <>
                 <div className="grid grid-cols-2 gap-2 md:grid-cols-4 xl:grid-cols-7">
                     <Select
                         value={draft.upstream || "all"}
-                        onValueChange={(val) => setDraft({ ...draft, upstream: val === "all" ? "" : val })}
+                        onValueChange={(val) => {
+                            const upstream = val === "all" ? "" : val
+                            setIdentityQuery('')
+                            setIdentityPage(1)
+                            setIdentityTotal(0)
+                            setSelectedIdentity(null)
+                            setIdentityOpen(false)
+                            setDraft({
+                                ...draft,
+                                upstream,
+                                identity_id: undefined,
+                                identity_upstream: undefined,
+                                identity_target: undefined,
+                            })
+                        }}
                     >
                         <SelectTrigger className={cn(
                             "w-full h-8 bg-background border border-input hover:bg-accent",
@@ -271,6 +480,161 @@ export function LogFilters({
                             ))}
                         </SelectContent>
                     </Select>
+
+                    {identityAuditEnabled && <div ref={identityPickerRef} className="relative min-w-0">
+                        <div className="relative">
+                            <button
+                                type="button"
+                                disabled={!identityUpstream}
+                                onClick={() => setIdentityOpen(open => !open)}
+                                className={cn(
+                                    'flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-background px-3 text-left text-xs transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50',
+                                    isIdentityChanged && 'border-primary/50 ring-1 ring-primary/20',
+                                )}
+                            >
+                                <span className={cn('truncate', !draft.identity_id && 'text-muted-foreground')}>
+                                    {draft.identity_id
+                                        ? `${selectedIdentity?.username || selectedIdentity?.email || draft.identity_id} (#${draft.identity_id})`
+                                        : identityUpstream
+                                            ? t('filters.identity_select_placeholder')
+                                            : t('filters.identity_select_upstream_short')}
+                                </span>
+                                <ChevronDown className={cn('h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform', identityOpen && 'rotate-180')} />
+                            </button>
+                            {draft.identity_id && (
+                                <button
+                                    type="button"
+                                    className="absolute right-7 top-1/2 -translate-y-1/2 rounded-sm bg-background p-0.5 text-muted-foreground hover:text-foreground"
+                                    onClick={(event) => {
+                                        event.stopPropagation()
+                                        setSelectedIdentity(null)
+                                        setDraft({
+                                            ...draft,
+                                            identity_id: undefined,
+                                            identity_upstream: undefined,
+                                            identity_target: undefined,
+                                        })
+                                    }}
+                                    aria-label={t('filters.identity_clear')}
+                                >
+                                    <X className="h-3 w-3" />
+                                </button>
+                            )}
+                        </div>
+
+                        {identityOpen && identityUpstream && (
+                            <div className="absolute right-0 top-full z-[70] mt-1 w-[min(640px,calc(100vw-24px))] overflow-hidden border border-border bg-popover text-popover-foreground shadow-lg sm:left-0 sm:right-auto">
+                                <div className="flex items-center gap-2 border-b border-border p-2">
+                                    <div className="relative min-w-0 flex-1">
+                                        <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                                        <Input
+                                            autoFocus
+                                            value={identityQuery}
+                                            placeholder={t('filters.identity_search_placeholder')}
+                                            onChange={(event) => {
+                                                setIdentityQuery(event.target.value)
+                                                setIdentityPage(1)
+                                            }}
+                                            className="h-7 w-full border border-input bg-background pl-8 text-xs"
+                                        />
+                                    </div>
+                                    <span className="shrink-0 text-xs text-muted-foreground">
+                                        {t('filters.identity_total', { count: identityTotal })}
+                                    </span>
+                                </div>
+
+                                <div className="max-h-[236px] overflow-auto">
+                                    <Table className="min-w-[600px] table-fixed">
+                                        <TableHeader className="sticky top-0 z-10 bg-muted">
+                                            <TableRow>
+                                                <TableHead className="w-[140px]">{t('filters.identity_source')}</TableHead>
+                                                <TableHead className="w-[110px]">{t('filters.identity_user_id')}</TableHead>
+                                                <TableHead>{t('filters.identity_email')}</TableHead>
+                                                <TableHead className="w-[140px]">{t('filters.identity_username')}</TableHead>
+                                            </TableRow>
+                                        </TableHeader>
+                                        <TableBody>
+                                            {identityLoading ? (
+                                                <TableRow>
+                                                    <TableCell colSpan={4} className="h-20 text-center text-xs text-muted-foreground">
+                                                        {t('filters.identity_loading')}
+                                                    </TableCell>
+                                                </TableRow>
+                                            ) : identityError ? (
+                                                <TableRow>
+                                                    <TableCell colSpan={4} className="h-20 text-center text-xs text-destructive">
+                                                        {identityError}
+                                                    </TableCell>
+                                                </TableRow>
+                                            ) : identityOptions.length === 0 ? (
+                                                <TableRow>
+                                                    <TableCell colSpan={4} className="h-20 text-center text-xs text-muted-foreground">
+                                                        {identityQuery.trim() ? t('filters.identity_no_results') : t('filters.identity_directory_empty')}
+                                                    </TableCell>
+                                                </TableRow>
+                                            ) : identityOptions.map(identity => {
+                                                const selected = draft.identity_id === identity.id &&
+                                                    draft.identity_upstream === identity.upstream &&
+                                                    (draft.identity_target || '') === (identity.target || '')
+                                                const selectIdentity = () => {
+                                                    setSelectedIdentity(identity)
+                                                    setDraft({
+                                                        ...draft,
+                                                        identity_id: identity.id,
+                                                        identity_upstream: identity.upstream,
+                                                        identity_target: identity.target || undefined,
+                                                    })
+                                                    setIdentityOpen(false)
+                                                }
+                                                return (
+                                                    <TableRow
+                                                        key={`${identity.upstream}\u0000${identity.target}\u0000${identity.id}`}
+                                                        data-state={selected ? 'selected' : undefined}
+                                                        className="cursor-pointer text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary"
+                                                        role="button"
+                                                        tabIndex={0}
+                                                        onClick={selectIdentity}
+                                                        onKeyDown={event => {
+                                                            if (event.key === 'Enter' || event.key === ' ') {
+                                                                event.preventDefault()
+                                                                selectIdentity()
+                                                            }
+                                                        }}
+                                                    >
+                                                        <TableCell className="truncate font-medium" title={identity.target ? `${identity.upstream} / ${identity.target}` : identity.upstream}>
+                                                            {identity.upstream}
+                                                            {identity.target && <span className="text-muted-foreground"> / {identity.target}</span>}
+                                                        </TableCell>
+                                                        <TableCell className="truncate font-mono" title={identity.id}>{identity.id}</TableCell>
+                                                        <TableCell className="truncate" title={identity.email || ''}>{identity.email || '-'}</TableCell>
+                                                        <TableCell className="truncate" title={identity.username || ''}>{identity.username || '-'}</TableCell>
+                                                    </TableRow>
+                                                )
+                                            })}
+                                        </TableBody>
+                                    </Table>
+                                </div>
+
+                                <div className="flex items-center justify-between border-t border-border px-2 py-1.5">
+                                    <span className="font-mono text-xs text-muted-foreground">{identityPage} / {identityTotalPages}</span>
+                                    <div className="flex items-center gap-1">
+                                        <Button type="button" variant="outline" size="icon" className="h-6 w-6" disabled={identityLoading || identityPage <= 1} onClick={() => setIdentityPage(1)} aria-label={t('filters.first_page')}>
+                                            <ChevronsLeft className="h-3 w-3" />
+                                        </Button>
+                                        <Button type="button" variant="outline" size="icon" className="h-6 w-6" disabled={identityLoading || identityPage <= 1} onClick={() => setIdentityPage(page => Math.max(1, page - 1))}>
+                                            <ChevronLeft className="h-3 w-3" />
+                                        </Button>
+                                        <Button type="button" variant="outline" size="icon" className="h-6 w-6" disabled={identityLoading || identityPage >= identityTotalPages} onClick={() => setIdentityPage(page => Math.min(identityTotalPages, page + 1))}>
+                                            <ChevronRight className="h-3 w-3" />
+                                        </Button>
+                                        <Button type="button" variant="outline" size="icon" className="h-6 w-6" disabled={identityLoading || identityPage >= identityTotalPages} onClick={() => setIdentityPage(identityTotalPages)} aria-label={t('filters.last_page')}>
+                                            <ChevronsRight className="h-3 w-3" />
+                                        </Button>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </div>}
 
                     <Select
                         value={draft.method || "all"}
@@ -370,6 +734,7 @@ export function LogFilters({
                         )}
                     />
                 </div>
+                </>
             )}
 
             {/* 分页 */}

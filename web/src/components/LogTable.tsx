@@ -1,5 +1,5 @@
 import { cn, formatDate, formatLatency, METHOD_CLASS, getStatusColor } from '@/lib/utils'
-import { BookmarkCheck, CheckCircle2, ChevronRight, CircleDot, Clock3, Network, Server, SlidersHorizontal, Tag as TagIcon, Tags, Zap } from 'lucide-react'
+import { BookmarkCheck, CheckCircle2, ChevronRight, CircleDot, Clock3, Network, Server, SlidersHorizontal, Tag as TagIcon, Tags, UserRound, Zap } from 'lucide-react'
 import type { RequestLog } from '@/lib/api'
 import { useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
@@ -23,6 +23,7 @@ interface LogTableProps {
     loading?: boolean
     onSelect: (log: RequestLog) => void
     selectedId?: string
+    identityAuditEnabled: boolean
 }
 
 function getStatusBadgeColor(code: number): string {
@@ -70,7 +71,7 @@ function MobileLogSkeleton() {
     )
 }
 
-function DesktopLogSkeleton({ t }: { t: (key: string) => string }) {
+function DesktopLogSkeleton({ t, identityAuditEnabled }: { t: (key: string) => string; identityAuditEnabled: boolean }) {
     return (
         <div className="hidden rounded-lg overflow-hidden bg-card md:block">
             <Table>
@@ -79,6 +80,7 @@ function DesktopLogSkeleton({ t }: { t: (key: string) => string }) {
                         <TableHead className="w-[80px]">{t('log_table.method')}</TableHead>
                         <TableHead className="w-[70px]">{t('log_table.status')}</TableHead>
                         <TableHead className="w-[150px]">{t('log_table.upstream')}</TableHead>
+                        {identityAuditEnabled && <TableHead className="w-[150px]">{t('log_table.identity')}</TableHead>}
                         <TableHead>{t('log_table.path')}</TableHead>
                         <TableHead className="w-[80px] text-right">{t('log_table.latency')}</TableHead>
                         <TableHead className="w-[160px] text-right">{t('log_table.time')}</TableHead>
@@ -88,7 +90,7 @@ function DesktopLogSkeleton({ t }: { t: (key: string) => string }) {
                 <TableBody>
                     {Array.from({ length: 8 }).map((_, rowIndex) => (
                         <TableRow key={rowIndex}>
-                            {Array.from({ length: 7 }).map((_, cellIndex) => (
+                            {Array.from({ length: identityAuditEnabled ? 8 : 7 }).map((_, cellIndex) => (
                                 <TableCell key={cellIndex}>
                                     <Skeleton className="h-5 w-full bg-muted/50" />
                                 </TableCell>
@@ -114,6 +116,7 @@ function MobileLogCard({
     modifiedLabel,
     tokensLabel,
     showUsage,
+    identityAuditEnabled,
 }: {
     log: RequestLog
     selected: boolean
@@ -127,6 +130,7 @@ function MobileLogCard({
     modifiedLabel: string
     tokensLabel: string
     showUsage: boolean
+    identityAuditEnabled: boolean
 }) {
     return (
         <button
@@ -164,6 +168,14 @@ function MobileLogCard({
                                 {log.upstream}{log.upstream_target ? ` / ${log.upstream_target}` : ''}
                             </span>
                         </span>
+                        {identityAuditEnabled && log.upstream_identity_id && (
+                            <span className="inline-flex max-w-full items-center gap-1 rounded-md bg-info/10 px-2.5 py-1 text-xs font-medium text-info">
+                                <UserRound className="h-3 w-3 shrink-0" />
+                                <span className="truncate">
+                                    {log.upstream_identity_label || `#${log.upstream_identity_id}`}
+                                </span>
+                            </span>
+                        )}
                         {log.streaming && (
                             <span className="inline-flex items-center gap-1 rounded-md bg-primary/10 px-2.5 py-1 text-xs font-medium text-primary">
                                 <Zap className="h-3 w-3" />
@@ -243,7 +255,7 @@ function MobileLogCard({
     )
 }
 
-export function LogTable({ logs, loading, onSelect, selectedId }: LogTableProps) {
+export function LogTable({ logs, loading, onSelect, selectedId, identityAuditEnabled }: LogTableProps) {
     const { t, i18n } = useTranslation()
     const navigate = useNavigate()
     const showUsage = logs.some(log => typeof log.usage_total_tokens === 'number')
@@ -252,7 +264,7 @@ export function LogTable({ logs, loading, onSelect, selectedId }: LogTableProps)
         return (
             <>
                 <MobileLogSkeleton />
-                <DesktopLogSkeleton t={t} />
+                <DesktopLogSkeleton t={t} identityAuditEnabled={identityAuditEnabled} />
             </>
         )
     }
@@ -287,6 +299,7 @@ export function LogTable({ logs, loading, onSelect, selectedId }: LogTableProps)
                         modifiedLabel={t('log_detail.modified', 'MODIFIED')}
                         tokensLabel={t('log_table.tokens', 'Tokens')}
                         showUsage={showUsage}
+                        identityAuditEnabled={identityAuditEnabled}
                     />
                 ))}
             </div>
@@ -300,6 +313,7 @@ export function LogTable({ logs, loading, onSelect, selectedId }: LogTableProps)
                             {/* 150 而不是 100:多目标预设的上游显示成 "anthropic / backup",
                                 100px 会截成 "anthropic / bac…",正好把想展示的功能藏掉 */}
                             <TableHead className="w-[150px] font-medium text-xs">{t('log_table.upstream')}</TableHead>
+                            {identityAuditEnabled && <TableHead className="w-[150px] font-medium text-xs">{t('log_table.identity')}</TableHead>}
                             <TableHead className="font-medium text-xs">{t('log_table.path')}</TableHead>
                             {showUsage && (
                                 <TableHead className="w-[90px] font-medium text-xs text-right">{t('log_table.tokens', 'Tokens')}</TableHead>
@@ -351,6 +365,22 @@ export function LogTable({ logs, loading, onSelect, selectedId }: LogTableProps)
                                         {log.upstream}{log.upstream_target ? ` / ${log.upstream_target}` : ''}
                                     </span>
                                 </TableCell>
+                                {identityAuditEnabled && <TableCell>
+                                    {log.upstream_identity_id ? (
+                                        <Tooltip>
+                                            <TooltipTrigger asChild>
+                                                <span className="block max-w-[150px] truncate text-xs font-medium text-info">
+                                                    {log.upstream_identity_label || `#${log.upstream_identity_id}`}
+                                                </span>
+                                            </TooltipTrigger>
+                                            <TooltipContent side="right">
+                                                <p className="text-xs">{log.upstream_identity_label || log.upstream_identity_id} (#{log.upstream_identity_id})</p>
+                                            </TooltipContent>
+                                        </Tooltip>
+                                    ) : (
+                                        <span className="text-xs text-muted-foreground/50">-</span>
+                                    )}
+                                </TableCell>}
                                 <TableCell className="max-w-0">
                                     <div className="flex items-center gap-2">
                                         <span className="truncate font-mono text-xs text-foreground/90 select-text">

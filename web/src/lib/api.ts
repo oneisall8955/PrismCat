@@ -4,6 +4,8 @@ export interface RequestLog {
     created_at: string
     upstream: string
     upstream_target?: string
+    upstream_identity_id?: string
+    upstream_identity_label?: string
     target_url: string
     method: string
     path: string
@@ -102,6 +104,7 @@ export interface Upstream {
     outbound_proxy: string
     logging_enabled: boolean
     logging_path_filter?: LoggingPathFilter
+    identity_resolution?: IdentityResolution
     active_target?: string
     targets?: Record<string, UpstreamTarget>
 }
@@ -174,6 +177,58 @@ export interface UpstreamTarget {
     outbound_proxy?: string
     request_overrides?: RuleBinding
     usage_extraction?: RuleBinding
+    identity_resolution?: IdentityResolution
+}
+
+export interface IdentityResolution {
+    provider: '' | 'sub2api'
+    admin_base_url?: string
+    admin_api_key?: string
+    admin_api_key_configured?: boolean
+    clear_admin_api_key?: boolean
+    sync_interval_seconds?: number
+}
+
+export interface UpstreamIdentity {
+    upstream: string
+    target: string
+    id: string
+    username?: string
+    email?: string
+    label: string
+}
+
+export interface IdentitySourceStatus {
+    upstream: string
+    target: string
+    provider: string
+    last_sync_at?: string
+    last_error?: string
+    identity_count: number
+    key_count: number
+    syncing: boolean
+    resolution_queued: boolean
+    resolving_logs: boolean
+    last_resolution_at?: string
+    resolution_error?: string
+    pending_logs_scanned: number
+    resolved_logs: number
+    unmatched_logs: number
+}
+
+export interface IdentityConnectionTestResult {
+    upstream: string
+    target: string
+    provider: string
+    identity_count: number
+}
+
+export interface UpstreamIdentityListResponse {
+    items: UpstreamIdentity[]
+    sources: IdentitySourceStatus[]
+    total: number
+    offset: number
+    limit: number
 }
 
 // 查询过滤参数
@@ -187,6 +242,9 @@ export interface LogFilter {
     saved?: boolean
     annotation_status?: LogAnnotationStatus
     annotation_label?: string
+    identity_id?: string
+    identity_upstream?: string
+    identity_target?: string
     start_time?: string
     end_time?: string
     offset?: number
@@ -371,18 +429,76 @@ export async function addUpstream(
     active_target: string = '',
     targets?: Record<string, UpstreamTarget>,
     logging_path_filter?: LoggingPathFilter,
+    identity_resolution?: IdentityResolution,
 ): Promise<void> {
     const response = await fetch(`${API_BASE}/upstreams`, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ name, target, timeout, response_header_timeout, response_body_first_byte_timeout, response_body_idle_timeout, order, outbound_proxy, logging_enabled, active_target, targets, logging_path_filter }),
+        body: JSON.stringify({ name, target, timeout, response_header_timeout, response_body_first_byte_timeout, response_body_idle_timeout, order, outbound_proxy, logging_enabled, active_target, targets, logging_path_filter, identity_resolution }),
     })
     if (!response.ok) {
         const error = await response.json().catch(() => ({ error: '请求失败' }))
         throw new Error(error.error || '添加上游失败')
     }
+}
+
+export async function fetchUpstreamIdentities(filter: {
+    upstream?: string
+    target?: string
+    query?: string
+    offset?: number
+    limit?: number
+} = {}): Promise<UpstreamIdentityListResponse> {
+    const params = new URLSearchParams()
+    if (filter.upstream) params.set('upstream', filter.upstream)
+    if (filter.target) params.set('target', filter.target)
+    if (filter.query) params.set('q', filter.query)
+    if (filter.offset !== undefined) params.set('offset', String(filter.offset))
+    if (filter.limit !== undefined) params.set('limit', String(filter.limit))
+    const response = await fetch(`${API_BASE}/upstream-identities?${params}`)
+    if (!response.ok) throw new Error('获取上游身份失败')
+    return response.json()
+}
+
+export async function syncUpstreamIdentity(upstream: string, target = ''): Promise<IdentitySourceStatus> {
+    const response = await fetch(`${API_BASE}/upstreams/identity-sync`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ upstream, target }),
+    })
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ error: '请求失败' }))
+        throw new Error(error.error || '同步上游身份失败')
+    }
+    return response.json()
+}
+
+export async function testUpstreamIdentity(upstream: string, target = ''): Promise<IdentityConnectionTestResult> {
+    const response = await fetch(`${API_BASE}/upstreams/identity-test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ upstream, target }),
+    })
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ error: '请求失败' }))
+        throw new Error(error.error || '测试上游身份连接失败')
+    }
+    return response.json()
+}
+
+export async function resolvePendingUpstreamIdentities(upstream: string, target = ''): Promise<IdentitySourceStatus> {
+    const response = await fetch(`${API_BASE}/upstream-identities/resolve-pending`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ upstream, target }),
+    })
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ error: '请求失败' }))
+        throw new Error(error.error || '补关联待处理日志失败')
+    }
+    return response.json()
 }
 
 export async function fetchModelPathTemplates(): Promise<ModelPathTemplatesResponse> {
@@ -487,6 +603,9 @@ export interface AppConfig {
         }>
         rules: unknown[]
     }
+    identity_resolution: {
+        enabled: boolean
+    }
 }
 
 export async function updateLogAnnotation(
@@ -539,6 +658,9 @@ export interface ConfigUpdate {
             rule_names: string[]
         }>
         rules?: unknown[]
+    }
+    identity_resolution?: {
+        enabled?: boolean
     }
 }
 

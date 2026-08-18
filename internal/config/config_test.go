@@ -93,6 +93,97 @@ func TestLoadPreservesExplicitLegacyPort(t *testing.T) {
 	}
 }
 
+func TestIdentityFingerprintSecretGeneratedAndPersisted(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	content := "upstreams:\n  audit:\n    target: https://sub2api.example.com\n    identity_resolution:\n      provider: sub2api\n      admin_api_key: admin-secret\n"
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if err := cfg.EnsureIdentityFingerprintSecretInitialized(); err != nil {
+		t.Fatalf("EnsureIdentityFingerprintSecretInitialized returned error: %v", err)
+	}
+	first, err := cfg.IdentityFingerprintSecret()
+	if err != nil || len(first) != 32 {
+		t.Fatalf("generated secret length = %d, err = %v", len(first), err)
+	}
+
+	saved, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read saved config: %v", err)
+	}
+	if !strings.Contains(string(saved), "fingerprint_secret:") {
+		t.Fatalf("saved config does not contain fingerprint secret:\n%s", saved)
+	}
+
+	reloaded, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	second, err := reloaded.IdentityFingerprintSecret()
+	if err != nil || string(first) != string(second) {
+		t.Fatalf("persisted secret changed, err = %v", err)
+	}
+}
+
+func TestIdentityAuditSwitchMigrationAndEnvironmentInitialValue(t *testing.T) {
+	t.Run("existing mapping migrates enabled", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yaml")
+		content := "storage:\n  database: " + strconvQuote(filepath.Join(dir, "logs.db")) + "\n  blob_dir: " + strconvQuote(filepath.Join(dir, "blobs")) + "\nupstreams:\n  audit:\n    target: https://example.com\n    identity_resolution:\n      provider: sub2api\n"
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		loaded, err := Load(path)
+		if err != nil {
+			t.Fatalf("load config: %v", err)
+		}
+		if !loaded.IdentityAuditEnabled() {
+			t.Fatal("legacy identity mapping should migrate with audit enabled")
+		}
+	})
+
+	t.Run("environment initializes missing setting", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yaml")
+		content := "storage:\n  database: " + strconvQuote(filepath.Join(dir, "logs.db")) + "\n  blob_dir: " + strconvQuote(filepath.Join(dir, "blobs")) + "\n"
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		t.Setenv("PRISMCAT_IDENTITY_AUDIT_ENABLED", "true")
+		loaded, err := Load(path)
+		if err != nil {
+			t.Fatalf("load config: %v", err)
+		}
+		if !loaded.IdentityAuditEnabled() {
+			t.Fatal("environment initial value was not applied")
+		}
+		loaded.SetIdentityAuditEnabled(false)
+		if err := loaded.Save(); err != nil {
+			t.Fatalf("save explicit switch: %v", err)
+		}
+		saved, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read saved config: %v", err)
+		}
+		reloaded, err := Load(path)
+		if err != nil {
+			t.Fatalf("reload config: %v", err)
+		}
+		if reloaded.IdentityAuditEnabled() {
+			t.Fatalf("explicit YAML false should override environment true:\n%s", saved)
+		}
+		if !strings.Contains(string(saved), "enabled: false") {
+			t.Fatalf("explicit disabled switch was not persisted:\n%s", saved)
+		}
+	})
+}
+
 func TestIsUIHostIncludesProxyDomainBase(t *testing.T) {
 	cfg := &Config{
 		Server: ServerConfig{

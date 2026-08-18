@@ -5,7 +5,7 @@ import {
   Network, ArrowLeft, Clock, AlertCircle, Layers, Activity,
   ChevronRight,
 } from 'lucide-react'
-import { fetchTraceDetail, type TraceDetail as TraceDetailType, type RequestLog } from '@/lib/api'
+import { fetchConfig, fetchTraceDetail, type TraceDetail as TraceDetailType, type RequestLog } from '@/lib/api'
 import { cn, formatLatency, formatDate, getStatusColor, METHOD_CLASS } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { LogDetail } from '@/components/LogDetail'
@@ -19,13 +19,15 @@ export function TraceDetail() {
   const [detail, setDetail] = useState<TraceDetailType | null>(null)
   const [loading, setLoading] = useState(true)
   const [selectedLog, setSelectedLog] = useState<RequestLog | null>(null)
+  const [identityAuditEnabled, setIdentityAuditEnabled] = useState(false)
 
   const loadDetail = useCallback(async () => {
     if (!traceId) return
     setLoading(true)
     try {
-      const res = await fetchTraceDetail(traceId)
+      const [res, appConfig] = await Promise.all([fetchTraceDetail(traceId), fetchConfig()])
       setDetail(res)
+      setIdentityAuditEnabled(appConfig.identity_resolution?.enabled ?? false)
     } catch {
       toast.error(t('traces.load_detail_failed'))
     } finally {
@@ -267,6 +269,7 @@ export function TraceDetail() {
         onNavigateLog={handleNavigateLog}
         canNavigatePreviousLog={selectedLogIndex > 0}
         canNavigateNextLog={selectedLogIndex >= 0 && selectedLogIndex < requests.length - 1}
+        identityAuditEnabled={identityAuditEnabled}
         onLogChange={(updated) => {
           setSelectedLog(updated)
           setDetail(prev => {

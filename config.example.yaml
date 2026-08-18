@@ -44,6 +44,13 @@ server:
     - "Content-Type"
     - "Authorization"
 
+# 上游身份关联使用的 HMAC 密钥。首次启用身份关联时自动生成并写回。
+# 迁移 PrismCat 时必须连同配置文件一起迁移；不要手工频繁更换。
+identity_resolution:
+  # 身份审计总开关。也可用 PRISMCAT_IDENTITY_AUDIT_ENABLED 设置首次默认值。
+  enabled: false
+  fingerprint_secret: ""
+
 # 上游路由配置
 # 格式: 子域名 -> 单个上游地址，或一组可切换的目标预设
 upstreams:
@@ -73,6 +80,13 @@ upstreams:
         - matcher: ant
           pattern: "/v1/chat/completions"
 
+    # 可选：当目标是 Sub2API 实例时，将日志关联到 Sub2API 用户 ID。
+    # identity_resolution:
+    #   provider: "sub2api"
+    #   admin_base_url: "https://sub2api.example.com/api/v1" # 留空则从 target 推导同源 /api/v1
+    #   admin_api_key: "your-admin-key"
+    #   sync_interval_seconds: 300
+
   gemini:
     # 匹配 gemini.localhost:8711
     target: "https://generativelanguage.googleapis.com"
@@ -100,6 +114,12 @@ upstreams:
         usage_extraction:
           enabled: false
           rule_names: []
+        # 身份关联属于目标预设；每个 Sub2API 实例独立配置。
+        # identity_resolution:
+        #   provider: "sub2api"
+        #   admin_base_url: "https://sub2api.example.com/api/v1"
+        #   admin_api_key: "your-admin-key"
+        #   sync_interval_seconds: 300
       backup:
         url: "https://api.example.com"
         timeout: 120

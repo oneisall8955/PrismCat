@@ -71,6 +71,9 @@ func (r *SQLiteRepository) migrate() error {
 		upstream TEXT NOT NULL,
 		upstream_target TEXT DEFAULT '',
 		target_url TEXT NOT NULL,
+		api_key_fingerprint TEXT DEFAULT '',
+		upstream_identity_id TEXT DEFAULT '',
+		identity_resolution_version TEXT DEFAULT '',
 		method TEXT NOT NULL,
 		path TEXT NOT NULL,
 		query TEXT,
@@ -145,6 +148,15 @@ func (r *SQLiteRepository) migrate() error {
 	if err := r.ensureLogColumn("upstream_target", "upstream_target TEXT DEFAULT ''"); err != nil {
 		return err
 	}
+	if err := r.ensureLogColumn("api_key_fingerprint", "api_key_fingerprint TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := r.ensureLogColumn("upstream_identity_id", "upstream_identity_id TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := r.ensureLogColumn("identity_resolution_version", "identity_resolution_version TEXT DEFAULT ''"); err != nil {
+		return err
+	}
 	if err := r.ensureLogColumn("tag", "tag TEXT DEFAULT ''"); err != nil {
 		return err
 	}
@@ -213,6 +225,15 @@ func (r *SQLiteRepository) migrate() error {
 	}
 	if _, err := r.db.Exec("CREATE INDEX IF NOT EXISTS idx_logs_trace_id_seq ON request_logs(trace_id, trace_seq)"); err != nil {
 		return fmt.Errorf("create trace_id_seq index: %w", err)
+	}
+	if _, err := r.db.Exec("CREATE INDEX IF NOT EXISTS idx_logs_identity ON request_logs(upstream, upstream_target, upstream_identity_id, created_at_unix_ms DESC)"); err != nil {
+		return fmt.Errorf("create upstream identity index: %w", err)
+	}
+	if _, err := r.db.Exec("CREATE INDEX IF NOT EXISTS idx_logs_pending_identity ON request_logs(upstream, upstream_target, created_at_unix_ms, id) WHERE api_key_fingerprint != '' AND upstream_identity_id = ''"); err != nil {
+		return fmt.Errorf("create pending identity index: %w", err)
+	}
+	if _, err := r.db.Exec("CREATE INDEX IF NOT EXISTS idx_logs_pending_identity_version ON request_logs(upstream, upstream_target, identity_resolution_version, created_at_unix_ms, id) WHERE api_key_fingerprint != '' AND upstream_identity_id = ''"); err != nil {
+		return fmt.Errorf("create pending identity version index: %w", err)
 	}
 	return nil
 }
@@ -396,7 +417,7 @@ func (r *SQLiteRepository) SaveLog(log *RequestLog) error {
 
 	query := `
 	INSERT INTO request_logs (
-		id, created_at, created_at_unix_ms, upstream, upstream_target, target_url, method, path, query,
+		id, created_at, created_at_unix_ms, upstream, upstream_target, target_url, api_key_fingerprint, upstream_identity_id, method, path, query,
 		request_headers, request_body, request_body_original, request_body_final, request_body_ref, request_body_size,
 		status_code, response_headers, response_body, response_body_ref, response_body_size,
 		streaming, latency_ms, error, truncated, tag,
@@ -404,13 +425,14 @@ func (r *SQLiteRepository) SaveLog(log *RequestLog) error {
 		request_header_override_applied, request_header_override_changes, request_headers_original,
 		trace_id, parent_log_id, trace_seq,
 		usage_input_tokens, usage_output_tokens, usage_total_tokens, usage_raw, usage_source
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
 		created_at = excluded.created_at,
 		created_at_unix_ms = excluded.created_at_unix_ms,
 		upstream = excluded.upstream,
 		upstream_target = excluded.upstream_target,
 		target_url = excluded.target_url,
+		api_key_fingerprint = CASE WHEN excluded.api_key_fingerprint != '' THEN excluded.api_key_fingerprint ELSE request_logs.api_key_fingerprint END,
 		method = excluded.method,
 		path = excluded.path,
 		query = excluded.query,
@@ -447,7 +469,7 @@ func (r *SQLiteRepository) SaveLog(log *RequestLog) error {
 	`
 
 	_, err := r.db.Exec(query,
-		log.ID, log.CreatedAt, log.CreatedAt.UnixMilli(), log.Upstream, log.UpstreamTarget, log.TargetURL, log.Method, log.Path, log.Query,
+		log.ID, log.CreatedAt, log.CreatedAt.UnixMilli(), log.Upstream, log.UpstreamTarget, log.TargetURL, log.APIKeyFingerprint, log.UpstreamIdentityID, log.Method, log.Path, log.Query,
 		string(reqHeaders), log.RequestBody, log.RequestBodyOriginal, log.RequestBodyFinal, log.RequestBodyRef, log.RequestBodySize,
 		log.StatusCode, string(respHeaders), log.ResponseBody, log.ResponseBodyRef, log.ResponseBodySize,
 		log.Streaming, log.Latency, log.Error, log.Truncated, log.Tag,
@@ -461,7 +483,7 @@ func (r *SQLiteRepository) SaveLog(log *RequestLog) error {
 
 func (r *SQLiteRepository) GetLog(id string) (*RequestLog, error) {
 	query := `
-	SELECT id, created_at, upstream, upstream_target, target_url, method, path, query,
+	SELECT id, created_at, upstream, upstream_target, target_url, upstream_identity_id, method, path, query,
 		request_headers, request_body, request_body_original, request_body_final, request_body_ref, request_body_size,
 		status_code, response_headers, response_body, response_body_ref, response_body_size,
 		streaming, latency_ms, error, truncated, tag,
@@ -502,7 +524,7 @@ func (r *SQLiteRepository) ListLogs(filter LogFilter) ([]*RequestLog, int64, err
 	}
 
 	query := fmt.Sprintf(`
-	SELECT l.id, l.created_at, l.upstream, l.upstream_target, l.target_url, l.method, l.path, l.query,
+	SELECT l.id, l.created_at, l.upstream, l.upstream_target, l.target_url, l.upstream_identity_id, l.method, l.path, l.query,
 		l.request_body_size, l.status_code, l.response_body_size,
 		l.streaming, l.latency_ms, l.error, l.truncated, l.tag, l.request_override_applied,
 		COALESCE(a.saved, 0), COALESCE(a.status, 'none'), COALESCE(a.note, ''), COALESCE(a.labels, '[]'),
@@ -585,6 +607,18 @@ func buildLogWhereClause(filter LogFilter) (string, []interface{}) {
 		conditions = append(conditions, "l.trace_id = ?")
 		args = append(args, filter.TraceID)
 	}
+	if filter.IdentityID != "" {
+		conditions = append(conditions, "l.upstream_identity_id = ?")
+		args = append(args, filter.IdentityID)
+	}
+	if filter.IdentityUpstream != "" {
+		conditions = append(conditions, "l.upstream = ?")
+		args = append(args, filter.IdentityUpstream)
+	}
+	if filter.IdentityTarget != "" {
+		conditions = append(conditions, "l.upstream_target = ?")
+		args = append(args, filter.IdentityTarget)
+	}
 	if filter.Saved != nil {
 		if *filter.Saved {
 			conditions = append(conditions, "COALESCE(a.saved, 0) = 1")
@@ -614,7 +648,7 @@ func (r *SQLiteRepository) ExportLogs(ctx context.Context, filter LogFilter, eac
 
 	where, args := buildLogWhereClause(filter)
 	query := fmt.Sprintf(`
-	SELECT l.id, l.created_at, l.upstream, l.upstream_target, l.target_url, l.method, l.path, l.query,
+	SELECT l.id, l.created_at, l.upstream, l.upstream_target, l.target_url, l.upstream_identity_id, l.method, l.path, l.query,
 		l.request_headers, l.request_body, l.request_body_original, l.request_body_final, l.request_body_ref, l.request_body_size,
 		l.status_code, l.response_headers, l.response_body, l.response_body_ref, l.response_body_size,
 		l.streaming, l.latency_ms, l.error, l.truncated, l.tag,
@@ -1024,7 +1058,7 @@ func (r *SQLiteRepository) ListTraces(filter TraceFilter) ([]TraceSummary, int64
 
 func (r *SQLiteRepository) GetTraceRequests(traceID string) ([]*RequestLog, error) {
 	query := `
-	SELECT id, created_at, upstream, upstream_target, target_url, method, path, query,
+	SELECT id, created_at, upstream, upstream_target, target_url, upstream_identity_id, method, path, query,
 		request_headers, request_body, request_body_original, request_body_final, request_body_ref, request_body_size,
 		status_code, response_headers, response_body, response_body_ref, response_body_size,
 		streaming, latency_ms, error, truncated, tag,
@@ -1057,6 +1091,82 @@ func (r *SQLiteRepository) GetTraceRequests(traceID string) ([]*RequestLog, erro
 		return nil, err
 	}
 	return logs, nil
+}
+
+func (r *SQLiteRepository) SetLogIdentityIfEmpty(logID, identityID string) (bool, error) {
+	logID = strings.TrimSpace(logID)
+	identityID = strings.TrimSpace(identityID)
+	if logID == "" || identityID == "" {
+		return false, nil
+	}
+	result, err := r.db.Exec(`
+		UPDATE request_logs
+		SET upstream_identity_id = ?
+		WHERE id = ? AND (upstream_identity_id IS NULL OR upstream_identity_id = '')
+	`, identityID, logID)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows > 0, err
+}
+
+func (r *SQLiteRepository) ListPendingIdentityLogs(upstream, target, directoryVersion string, afterMS int64, afterID string, limit int) ([]PendingIdentityLog, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 500
+	}
+	rows, err := r.db.Query(`
+		SELECT id, upstream, upstream_target, api_key_fingerprint, created_at_unix_ms
+		FROM request_logs
+		WHERE upstream = ? AND upstream_target = ?
+			AND api_key_fingerprint != ''
+			AND (upstream_identity_id IS NULL OR upstream_identity_id = '')
+			AND (? = '' OR COALESCE(identity_resolution_version, '') != ?)
+			AND (created_at_unix_ms > ? OR (created_at_unix_ms = ? AND id > ?))
+		ORDER BY created_at_unix_ms ASC, id ASC
+		LIMIT ?
+	`, upstream, target, directoryVersion, directoryVersion, afterMS, afterMS, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var pending []PendingIdentityLog
+	for rows.Next() {
+		var item PendingIdentityLog
+		if err := rows.Scan(&item.ID, &item.Upstream, &item.UpstreamTarget, &item.Fingerprint, &item.CreatedAtMS); err != nil {
+			return nil, err
+		}
+		pending = append(pending, item)
+	}
+	return pending, rows.Err()
+}
+
+func (r *SQLiteRepository) MarkLogsIdentityResolutionVersion(logIDs []string, directoryVersion string) error {
+	directoryVersion = strings.TrimSpace(directoryVersion)
+	if len(logIDs) == 0 || directoryVersion == "" {
+		return nil
+	}
+	placeholders := make([]string, 0, len(logIDs))
+	args := make([]any, 0, len(logIDs)+1)
+	args = append(args, directoryVersion)
+	for _, logID := range logIDs {
+		logID = strings.TrimSpace(logID)
+		if logID == "" {
+			continue
+		}
+		placeholders = append(placeholders, "?")
+		args = append(args, logID)
+	}
+	if len(placeholders) == 0 {
+		return nil
+	}
+	_, err := r.db.Exec(`
+		UPDATE request_logs
+		SET identity_resolution_version = ?
+		WHERE id IN (`+strings.Join(placeholders, ",")+`)
+			AND (upstream_identity_id IS NULL OR upstream_identity_id = '')
+	`, args...)
+	return err
 }
 
 func (r *SQLiteRepository) Close() error {
@@ -1105,7 +1215,7 @@ func (r *SQLiteRepository) scanLogSummary(scanner interface{ Scan(...interface{}
 	var usageInput, usageOutput, usageTotal sql.NullInt64
 
 	err := scanner.Scan(
-		&log.ID, &log.CreatedAt, &log.Upstream, &log.UpstreamTarget, &log.TargetURL, &log.Method, &log.Path, &log.Query,
+		&log.ID, &log.CreatedAt, &log.Upstream, &log.UpstreamTarget, &log.TargetURL, &log.UpstreamIdentityID, &log.Method, &log.Path, &log.Query,
 		&log.RequestBodySize, &log.StatusCode, &log.ResponseBodySize,
 		&streaming, &log.Latency, &log.Error, &truncated, &log.Tag, &overrideApplied,
 		&annotationSaved, &log.Annotation.Status, &log.Annotation.Note, &annotationLabels,
@@ -1147,7 +1257,7 @@ func (r *SQLiteRepository) scanLog(scanner interface{ Scan(...interface{}) error
 	var usageRaw, usageSource sql.NullString
 
 	err := scanner.Scan(
-		&log.ID, &log.CreatedAt, &log.Upstream, &log.UpstreamTarget, &log.TargetURL, &log.Method, &log.Path, &log.Query,
+		&log.ID, &log.CreatedAt, &log.Upstream, &log.UpstreamTarget, &log.TargetURL, &log.UpstreamIdentityID, &log.Method, &log.Path, &log.Query,
 		&reqHeaders, &log.RequestBody, &log.RequestBodyOriginal, &log.RequestBodyFinal, &log.RequestBodyRef, &log.RequestBodySize,
 		&log.StatusCode, &respHeaders, &log.ResponseBody, &log.ResponseBodyRef, &log.ResponseBodySize,
 		&streaming, &log.Latency, &log.Error, &truncated, &log.Tag,
@@ -1207,7 +1317,7 @@ func (r *SQLiteRepository) scanLogWithAnnotation(scanner interface{ Scan(...inte
 	var annotationCreatedMS, annotationUpdatedMS int64
 
 	err := scanner.Scan(
-		&log.ID, &log.CreatedAt, &log.Upstream, &log.UpstreamTarget, &log.TargetURL, &log.Method, &log.Path, &log.Query,
+		&log.ID, &log.CreatedAt, &log.Upstream, &log.UpstreamTarget, &log.TargetURL, &log.UpstreamIdentityID, &log.Method, &log.Path, &log.Query,
 		&reqHeaders, &log.RequestBody, &log.RequestBodyOriginal, &log.RequestBodyFinal, &log.RequestBodyRef, &log.RequestBodySize,
 		&log.StatusCode, &respHeaders, &log.ResponseBody, &log.ResponseBodyRef, &log.ResponseBodySize,
 		&streaming, &log.Latency, &log.Error, &truncated, &log.Tag,

@@ -52,6 +52,18 @@ func (c *ClientCache) ClientWithResponseHeaderTimeout(outboundProxy string, time
 	return client, nil
 }
 
+func (c *ClientCache) CloseIdleConnections() {
+	c.mu.Lock()
+	clients := make([]*http.Client, 0, len(c.clients))
+	for _, client := range c.clients {
+		clients = append(clients, client)
+	}
+	c.mu.Unlock()
+	for _, client := range clients {
+		client.CloseIdleConnections()
+	}
+}
+
 func clientCacheKey(outboundProxy string, timeout time.Duration) string {
 	return outboundProxy + "\x00" + timeout.String()
 }

@@ -274,6 +274,10 @@ server:
   proxy_domains:            # Base domains for subdomain routing
     - localhost
 
+identity_resolution:
+  enabled: false            # Global identity-audit switch
+  fingerprint_secret: ""    # Generated on first enable; preserve this when migrating
+
 logging:
   max_request_body: 5242880       # Save request content up to 5MB
   max_response_body: 33554432     # Save response content up to 32MB
@@ -308,6 +312,12 @@ upstreams:
           pattern: "/v1/responses"
         - matcher: regex
           pattern: "^/v1/chat/completions$"
+    # Enable identity resolution when this target is a Sub2API instance
+    identity_resolution:
+      provider: sub2api
+      admin_base_url: "https://sub2api.example.com/api/v1" # leave empty to derive from target
+      admin_api_key: "your-admin-key"
+      sync_interval_seconds: 300
   gemini:
     target: "https://generativelanguage.googleapis.com"
     timeout: 120
@@ -352,6 +362,24 @@ usage_extraction:
 ```
 
 </details>
+
+### Upstream identity auditing
+
+Enable the global **Identity audit** switch on the Upstreams settings page, then enable **Upstream identity** for a Sub2API upstream or target preset. PrismCat uses `x-api-key` with the Sub2API Admin API to synchronize users and API keys, then asynchronously assigns the Sub2API user ID after each request log is persisted. Synchronization failures never delay or interrupt proxy traffic.
+
+- `identity_resolution.enabled` is the global switch. Turning it off stops key fingerprint capture, directory sync, unknown-key refresh, and log association, and hides identity columns, filters, and details. Saved upstream mapping settings and historical identity results are preserved.
+- `PRISMCAT_IDENTITY_AUDIT_ENABLED` supplies an initial value only when YAML has no explicit `enabled` field. Once saved in the UI, YAML takes precedence. Existing installations with identity mappings are migrated as enabled.
+
+- Audit ownership is scoped by upstream, target preset, and user ID, so identical IDs from separate instances remain isolated.
+- The database stores only an HMAC-SHA256 key fingerprint and the original user ID. API key plaintext, usernames, and email addresses are not persisted; names come from the current in-memory directory.
+- An assigned identity ID is immutable. Logs from before this feature are not backfilled; newly fingerprinted unresolved logs are retried after synchronization or restart.
+- The config API never returns the Admin Key or fingerprint secret. An empty Admin Key field preserves the current value; use the separate clear action to remove it.
+- Migrate the config file with the database. Changing `fingerprint_secret` affects only unresolved logs.
+- **Test connection** in Settings only validates the Admin API. **Refresh identity directory** fetches all users and keys, then queues log resolution in the background without waiting for the historical scan.
+- Requests without an authentication key do not create fingerprints or identity work. Unknown keys reuse a negative lookup while the directory is fresh; once stale, all concurrent unknown keys for the same source coalesce into one refresh. Failed automatic refreshes retry at the configured interval.
+- Unmatched logs record an internal version of the key directory. They are not scanned repeatedly while the directory is unchanged, but become eligible again when an upstream key is added or reassigned.
+
+On the log page, select an upstream first, then search by username, email, or ID in the compact table that opens below the user filter. Multi-target upstreams are combined with the target preset shown in the source column; selecting a user still submits the upstream, target preset, and ID together. The identity refresh button resolves pending logs for the exact selected source in the background and reports matched and unmatched counts. JSONL exports include `upstream_identity_id`, but not the fingerprint or current display label.
 
 ---
 

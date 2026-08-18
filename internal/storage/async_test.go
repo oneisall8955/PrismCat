@@ -17,6 +17,10 @@ type memRepo struct {
 	logs   []*RequestLog
 }
 
+type failingSaveRepo struct{ *memRepo }
+
+func (r *failingSaveRepo) SaveLog(*RequestLog) error { return errors.New("save failed") }
+
 func (m *memRepo) SaveLog(log *RequestLog) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -67,6 +71,59 @@ func (m *memBlobStore) Put(ctx context.Context, b []byte) (string, error) {
 	m.puts++
 	m.data = append(m.data, append([]byte(nil), b...))
 	return "sha256:" + strings.Repeat("0", 64), nil
+}
+
+func TestAsyncRepositoryRunsIdentityHookOnlyAfterSuccessfulPersistence(t *testing.T) {
+	cfg := &config.Config{}
+	inner := &memRepo{}
+	repo := NewAsyncRepository(inner, cfg, 4)
+	hooked := make(chan *RequestLog, 1)
+	repo.SetAfterSaveHook(func(entry *RequestLog) { hooked <- entry })
+	if err := repo.SaveLog(&RequestLog{ID: "ready", APIKeyFingerprint: "fingerprint", IdentityResolutionReady: true}); err != nil {
+		t.Fatalf("SaveLog: %v", err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case entry := <-hooked:
+		if entry.ID != "ready" || entry.APIKeyFingerprint != "fingerprint" {
+			t.Fatalf("hook entry = %#v", entry)
+		}
+	default:
+		t.Fatal("post-save hook was not called")
+	}
+
+	failing := NewAsyncRepository(&failingSaveRepo{memRepo: &memRepo{}}, cfg, 4)
+	failedHook := make(chan struct{}, 1)
+	failing.SetAfterSaveHook(func(*RequestLog) { failedHook <- struct{}{} })
+	if err := failing.SaveLog(&RequestLog{ID: "failed", APIKeyFingerprint: "fingerprint", IdentityResolutionReady: true}); err != nil {
+		t.Fatalf("enqueue failed log: %v", err)
+	}
+	if err := failing.Close(); err != nil {
+		t.Fatalf("close failing repo: %v", err)
+	}
+	select {
+	case <-failedHook:
+		t.Fatal("post-save hook ran after failed persistence")
+	default:
+	}
+}
+
+func TestAsyncRepositoryDropsFingerprintFromIncompleteSnapshot(t *testing.T) {
+	inner := &memRepo{}
+	repo := NewAsyncRepository(inner, &config.Config{}, 4)
+	if err := repo.SaveLog(&RequestLog{ID: "inflight", APIKeyFingerprint: "must-not-persist"}); err != nil {
+		t.Fatalf("SaveLog: %v", err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	inner.mu.Lock()
+	defer inner.mu.Unlock()
+	if len(inner.logs) != 1 || inner.logs[0].APIKeyFingerprint != "" {
+		t.Fatalf("incomplete snapshot persisted fingerprint: %#v", inner.logs)
+	}
 }
 
 func (m *memBlobStore) Get(ctx context.Context, ref string) ([]byte, error) {

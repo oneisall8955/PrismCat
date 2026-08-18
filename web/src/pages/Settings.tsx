@@ -29,6 +29,7 @@ import {
     Route,
     Eye,
     EyeOff,
+    Wifi,
 } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
@@ -67,8 +68,8 @@ import {
     TableHeader,
     TableRow,
 } from '@/components/ui/table'
-import { DEFAULT_UPSTREAM_TIMEOUT_SECONDS, fetchUpstreams, addUpstream, removeUpstream, activateUpstreamTarget, fetchConfig, updateConfig, fetchSystemMetrics, fetchUpdateInfo, fetchStorageUsage, fetchModelPathTemplates } from '@/lib/api'
-import type { Upstream, UpstreamTarget, AppConfig, SystemMetrics, UpdateInfo, StorageUsage, LoggingPathFilter, ModelPathTemplate } from '@/lib/api'
+import { DEFAULT_UPSTREAM_TIMEOUT_SECONDS, fetchUpstreams, addUpstream, removeUpstream, activateUpstreamTarget, fetchConfig, updateConfig, fetchSystemMetrics, fetchUpdateInfo, fetchStorageUsage, fetchModelPathTemplates, fetchUpstreamIdentities, syncUpstreamIdentity, testUpstreamIdentity } from '@/lib/api'
+import type { Upstream, UpstreamTarget, AppConfig, SystemMetrics, UpdateInfo, StorageUsage, LoggingPathFilter, ModelPathTemplate, IdentityResolution, IdentitySourceStatus } from '@/lib/api'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
@@ -180,6 +181,12 @@ type EditingUpstream = {
     ruleNames: string[]
     usageEnabled: boolean
     usageRuleNames: string[]
+    identityEnabled: boolean
+    identityAdminBaseURL: string
+    identityAdminAPIKey: string
+    identityAdminAPIKeyConfigured: boolean
+    identityClearAdminAPIKey: boolean
+    identitySyncInterval: number
     usesTargetPresets: boolean
     activeTarget: string
     selectedTarget: string
@@ -209,6 +216,19 @@ function editingBufferAsTarget(upstream: EditingUpstream): UpstreamTarget {
             enabled: upstream.usageEnabled,
             rule_names: upstream.usageRuleNames,
         },
+        identity_resolution: editingIdentityResolution(upstream),
+    }
+}
+
+function editingIdentityResolution(upstream: EditingUpstream): IdentityResolution {
+    if (!upstream.identityEnabled) return { provider: '' }
+    return {
+        provider: 'sub2api',
+        admin_base_url: upstream.identityAdminBaseURL.trim() || undefined,
+        admin_api_key: upstream.identityAdminAPIKey.trim() || undefined,
+        admin_api_key_configured: upstream.identityAdminAPIKeyConfigured,
+        clear_admin_api_key: upstream.identityClearAdminAPIKey || undefined,
+        sync_interval_seconds: upstream.identitySyncInterval || 300,
     }
 }
 
@@ -239,6 +259,12 @@ function loadTargetBuffer(upstream: EditingUpstream, targetName: string): Editin
         ruleNames: target.request_overrides?.rule_names || [],
         usageEnabled: target.usage_extraction?.enabled ?? false,
         usageRuleNames: target.usage_extraction?.rule_names || [],
+        identityEnabled: target.identity_resolution?.provider === 'sub2api',
+        identityAdminBaseURL: target.identity_resolution?.admin_base_url || '',
+        identityAdminAPIKey: '',
+        identityAdminAPIKeyConfigured: target.identity_resolution?.admin_api_key_configured ?? false,
+        identityClearAdminAPIKey: false,
+        identitySyncInterval: target.identity_resolution?.sync_interval_seconds || 300,
     }
 }
 
@@ -828,11 +854,19 @@ export function Settings() {
     const [newOutboundProxy, setNewOutboundProxy] = useState('env')
     const [newLoggingEnabled, setNewLoggingEnabled] = useState(true)
     const [newLoggingPathFilter, setNewLoggingPathFilter] = useState<LoggingPathFilter>({ mode: 'all', rules: [] })
+    const [newIdentityEnabled, setNewIdentityEnabled] = useState(false)
+    const [newIdentityAdminBaseURL, setNewIdentityAdminBaseURL] = useState('')
+    const [newIdentityAdminAPIKey, setNewIdentityAdminAPIKey] = useState('')
+    const [newIdentitySyncInterval, setNewIdentitySyncInterval] = useState(300)
     const [modelPathTemplates, setModelPathTemplates] = useState<ModelPathTemplate[]>([])
     const [editingUpstream, setEditingUpstream] = useState<EditingUpstream | null>(null)
     const [upstreamAdvancedOpen, setUpstreamAdvancedOpen] = useState(false)
     const [newTargetPresetName, setNewTargetPresetName] = useState('')
     const [switchingTarget, setSwitchingTarget] = useState('')
+    const [identityTesting, setIdentityTesting] = useState(false)
+    const [identitySyncing, setIdentitySyncing] = useState(false)
+    const [identitySyncStatus, setIdentitySyncStatus] = useState<IdentitySourceStatus | null>(null)
+    const [identityAuditEnabled, setIdentityAuditEnabled] = useState(false)
 
     const [enablePathRouting, setEnablePathRouting] = useState(false)
     const [pathRoutingPrefix, setPathRoutingPrefix] = useState('/_proxy')
@@ -1092,6 +1126,7 @@ export function Settings() {
             setOverrideRulesText(overrideRules.length ? JSON.stringify(overrideRules, null, 2) : '')
             setUsageExtractionEnabled(configData.usage_extraction?.enabled ?? false)
             setUsageBindings(configData.usage_extraction?.upstreams ?? {})
+            setIdentityAuditEnabled(configData.identity_resolution?.enabled ?? false)
             const usageRules = configData.usage_extraction?.rules ?? []
             setUsageRulesText(usageRules.length ? JSON.stringify(usageRules, null, 2) : usageExtractionExample)
         } catch (err) {
@@ -1184,6 +1219,12 @@ export function Settings() {
                 '',
                 undefined,
                 newLoggingPathFilter,
+                newIdentityEnabled ? {
+                    provider: 'sub2api',
+                    admin_base_url: newIdentityAdminBaseURL.trim() || undefined,
+                    admin_api_key: newIdentityAdminAPIKey.trim() || undefined,
+                    sync_interval_seconds: newIdentitySyncInterval || 300,
+                } : undefined,
             )
             setNewName('')
             setNewTarget('')
@@ -1195,6 +1236,10 @@ export function Settings() {
             setNewOutboundProxy('env')
             setNewLoggingEnabled(true)
             setNewLoggingPathFilter({ mode: 'all', rules: [] })
+            setNewIdentityEnabled(false)
+            setNewIdentityAdminBaseURL('')
+            setNewIdentityAdminAPIKey('')
+            setNewIdentitySyncInterval(300)
             setShowAddForm(false)
             loadData()
             toast.success(t('settings.upstream_added'))
@@ -1596,6 +1641,16 @@ export function Settings() {
         setUsageRulesArray(nextRules, index)
     }
 
+    const loadIdentityStatus = useCallback((upstream: string, target = '') => {
+        if (!identityAuditEnabled) {
+            setIdentitySyncStatus(null)
+            return
+        }
+        fetchUpstreamIdentities({ upstream, target })
+            .then(result => setIdentitySyncStatus(result.sources?.[0] || null))
+            .catch(() => setIdentitySyncStatus(null))
+    }, [identityAuditEnabled])
+
     const handleEditUpstream = useCallback((upstream: Upstream) => {
         const binding = overrideBindings[upstream.name]
         const usageBinding = usageBindings[upstream.name]
@@ -1632,14 +1687,21 @@ export function Settings() {
             ruleNames: usesTargetPresets ? [] : getBindingRuleNames(binding),
             usageEnabled: usesTargetPresets ? false : (usageBinding?.enabled ?? false),
             usageRuleNames: usesTargetPresets ? [] : getBindingRuleNames(usageBinding),
+            identityEnabled: !usesTargetPresets && upstream.identity_resolution?.provider === 'sub2api',
+            identityAdminBaseURL: !usesTargetPresets ? (upstream.identity_resolution?.admin_base_url || '') : '',
+            identityAdminAPIKey: '',
+            identityAdminAPIKeyConfigured: !usesTargetPresets && (upstream.identity_resolution?.admin_api_key_configured ?? false),
+            identityClearAdminAPIKey: false,
+            identitySyncInterval: !usesTargetPresets ? (upstream.identity_resolution?.sync_interval_seconds || 300) : 300,
             usesTargetPresets,
             activeTarget: upstream.active_target || selectedTarget,
             selectedTarget,
             targets,
         }
         setNewTargetPresetName('')
+        loadIdentityStatus(upstream.name, selectedTarget)
         setEditingUpstream(usesTargetPresets ? loadTargetBuffer(editing, selectedTarget) : editing)
-    }, [overrideBindings, usageBindings])
+    }, [loadIdentityStatus, overrideBindings, usageBindings])
 
     useEffect(() => {
         if (deepLinkHandled.current || loading || activeTab !== 'routing') return
@@ -1672,6 +1734,7 @@ export function Settings() {
         if (hasAdvancedValues(editingUpstream?.targets[targetName])) {
             setUpstreamAdvancedOpen(true)
         }
+        if (editingUpstream) loadIdentityStatus(editingUpstream.name, targetName)
         setEditingUpstream(current => {
             if (!current) return current
             return loadTargetBuffer(commitSelectedTarget(current), targetName)
@@ -1700,6 +1763,7 @@ export function Settings() {
                     enabled: false,
                     rule_names: [],
                 },
+                identity_resolution: undefined,
             }
             const next = { ...committed, targets: { ...committed.targets, [name]: target } }
             return loadTargetBuffer(next, name)
@@ -1737,6 +1801,72 @@ export function Settings() {
                 : current.usageRuleNames.filter(name => name !== ruleName)
             return { ...current, usageRuleNames: nextRules }
         })
+    }
+
+    const persistEditingIdentitySource = async () => {
+        if (!editingUpstream?.identityEnabled) return null
+        const committed = commitSelectedTarget(editingUpstream)
+        await addUpstream(
+                committed.name,
+                committed.usesTargetPresets ? '' : committed.target,
+                committed.usesTargetPresets ? 0 : committed.timeout,
+                committed.usesTargetPresets ? 0 : committed.responseHeaderTimeout,
+                committed.usesTargetPresets ? 0 : committed.responseBodyFirstByteTimeout,
+                committed.usesTargetPresets ? 0 : committed.responseBodyIdleTimeout,
+                committed.order,
+                committed.usesTargetPresets ? '' : normalizedOutboundProxy(committed.outboundProxy),
+                committed.loggingEnabled,
+                committed.usesTargetPresets ? committed.activeTarget : '',
+                committed.usesTargetPresets ? committed.targets : undefined,
+                committed.loggingPathFilter,
+                committed.usesTargetPresets ? undefined : editingIdentityResolution(committed),
+        )
+        setEditingUpstream(current => current ? {
+            ...current,
+            identityAdminAPIKey: '',
+            identityAdminAPIKeyConfigured: true,
+            identityClearAdminAPIKey: false,
+        } : current)
+        return {
+            upstream: committed.name,
+            target: committed.usesTargetPresets ? committed.selectedTarget : '',
+        }
+    }
+
+    const handleTestUpstreamIdentity = async () => {
+        setIdentityTesting(true)
+        try {
+            const source = await persistEditingIdentitySource()
+            if (!source) return
+            const result = await testUpstreamIdentity(source.upstream, source.target)
+            toast.success(t('upstream_manager.identity_test_success', { users: result.identity_count }))
+        } catch (err: unknown) {
+            toast.error(getErrorMessage(err, t('upstream_manager.identity_test_failed')))
+        } finally {
+            setIdentityTesting(false)
+        }
+    }
+
+    const handleSyncUpstreamIdentity = async () => {
+        setIdentitySyncing(true)
+        setIdentitySyncStatus(null)
+        try {
+            const source = await persistEditingIdentitySource()
+            if (!source) return
+            const status = await syncUpstreamIdentity(
+                source.upstream,
+                source.target,
+            )
+            setIdentitySyncStatus(status)
+            toast.success(t('upstream_manager.identity_sync_success', {
+                users: status.identity_count,
+                keys: status.key_count,
+            }))
+        } catch (err: unknown) {
+            toast.error(getErrorMessage(err, t('upstream_manager.identity_sync_failed')))
+        } finally {
+            setIdentitySyncing(false)
+        }
     }
 
     const handleSaveUpstreamEdit = async () => {
@@ -1777,6 +1907,7 @@ export function Settings() {
                 committed.usesTargetPresets ? committed.activeTarget : '',
                 committed.usesTargetPresets ? committed.targets : undefined,
                 committed.loggingPathFilter,
+                committed.usesTargetPresets ? undefined : editingIdentityResolution(committed),
             )
             await updateConfig({
                 request_overrides: buildOverridesPayload(nextBindings, overrideRules),
@@ -1837,6 +1968,7 @@ export function Settings() {
                 },
                 request_overrides: buildOverridesPayload(overrideBindings, overrideRules),
                 usage_extraction: buildUsageExtractionPayload(usageBindings, usageRules),
+                identity_resolution: { enabled: identityAuditEnabled },
             })
             await saveDirtyTargetBindings()
             toast.success(t('settings.config_saved'))
@@ -2049,6 +2181,118 @@ export function Settings() {
                                                     </FieldBlock>
                                                 </div>
                                             </div>
+
+                                            {identityAuditEnabled && <div className="space-y-4 border-t border-border pt-5">
+                                                <div className="flex items-center justify-between gap-4">
+                                                    <div>
+                                                        <Label className="text-sm font-medium">{t('upstream_manager.identity_resolution')}</Label>
+                                                        <p className="mt-1 text-xs text-muted-foreground">{t('upstream_manager.identity_resolution_hint')}</p>
+                                                    </div>
+                                                    <Switch
+                                                        checked={editingUpstream.identityEnabled}
+                                                        onCheckedChange={checked => setEditingUpstream(current => current ? { ...current, identityEnabled: checked } : current)}
+                                                    />
+                                                </div>
+                                                {editingUpstream.identityEnabled && (
+                                                    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                                                        <FieldBlock label={t('upstream_manager.identity_provider')}>
+                                                            <Select value="sub2api" disabled>
+                                                                <SelectTrigger className="h-9 bg-background"><SelectValue /></SelectTrigger>
+                                                                <SelectContent><SelectItem value="sub2api">Sub2API</SelectItem></SelectContent>
+                                                            </Select>
+                                                        </FieldBlock>
+                                                        <FieldBlock label={t('upstream_manager.identity_admin_url')} hint={t('upstream_manager.identity_admin_url_hint')}>
+                                                            <Input
+                                                                value={editingUpstream.identityAdminBaseURL}
+                                                                onChange={event => setEditingUpstream(current => current ? { ...current, identityAdminBaseURL: event.target.value } : current)}
+                                                                placeholder="https://sub2api.example.com/api/v1"
+                                                                className="h-9 bg-background font-mono text-xs"
+                                                            />
+                                                        </FieldBlock>
+                                                        <FieldBlock label={t('upstream_manager.identity_admin_key')}>
+                                                            <div className="flex gap-2">
+                                                                <Input
+                                                                    type="password"
+                                                                    value={editingUpstream.identityAdminAPIKey}
+                                                                    onChange={event => setEditingUpstream(current => current ? {
+                                                                        ...current,
+                                                                        identityAdminAPIKey: event.target.value,
+                                                                        identityClearAdminAPIKey: false,
+                                                                    } : current)}
+                                                                    placeholder={editingUpstream.identityAdminAPIKeyConfigured
+                                                                        ? t('upstream_manager.identity_key_keep')
+                                                                        : t('upstream_manager.identity_key_required')}
+                                                                    className="h-9 bg-background font-mono text-xs"
+                                                                />
+                                                                {editingUpstream.identityAdminAPIKeyConfigured && (
+                                                                    <Button
+                                                                        type="button"
+                                                                        variant="outline"
+                                                                        size="icon"
+                                                                        className="h-9 w-9 shrink-0"
+                                                                        onClick={() => setEditingUpstream(current => current ? {
+                                                                            ...current,
+                                                                            identityAdminAPIKey: '',
+                                                                            identityAdminAPIKeyConfigured: false,
+                                                                            identityClearAdminAPIKey: true,
+                                                                        } : current)}
+                                                                        aria-label={t('upstream_manager.identity_key_clear')}
+                                                                        title={t('upstream_manager.identity_key_clear')}
+                                                                    >
+                                                                        <Trash2 className="h-4 w-4" />
+                                                                    </Button>
+                                                                )}
+                                                            </div>
+                                                        </FieldBlock>
+                                                        <FieldBlock label={t('upstream_manager.identity_sync_interval')}>
+                                                            <Input
+                                                                type="number"
+                                                                min="60"
+                                                                max="86400"
+                                                                value={editingUpstream.identitySyncInterval}
+                                                                onChange={event => setEditingUpstream(current => current ? { ...current, identitySyncInterval: Number(event.target.value) } : current)}
+                                                                className="h-9 bg-background text-sm"
+                                                            />
+                                                        </FieldBlock>
+                                                        <div className="flex flex-wrap items-center gap-3 sm:col-span-2">
+                                                            <Button
+                                                                type="button"
+                                                                variant="outline"
+                                                                size="sm"
+                                                                className="h-8"
+                                                                disabled={identityTesting || identitySyncing || (!editingUpstream.identityAdminAPIKeyConfigured && !editingUpstream.identityAdminAPIKey.trim())}
+                                                                onClick={handleTestUpstreamIdentity}
+                                                            >
+                                                                <Wifi className={cn('mr-1.5 h-3.5 w-3.5', identityTesting && 'animate-pulse')} />
+                                                                {t('upstream_manager.identity_test_connection')}
+                                                            </Button>
+                                                            <Button
+                                                                type="button"
+                                                                variant="outline"
+                                                                size="sm"
+                                                                className="h-8"
+                                                                disabled={identityTesting || identitySyncing || (!editingUpstream.identityAdminAPIKeyConfigured && !editingUpstream.identityAdminAPIKey.trim())}
+                                                                onClick={handleSyncUpstreamIdentity}
+                                                            >
+                                                                <RefreshCw className={cn('mr-1.5 h-3.5 w-3.5', identitySyncing && 'animate-spin')} />
+                                                                {t('upstream_manager.identity_refresh_directory')}
+                                                            </Button>
+                                                            {identitySyncStatus && (
+                                                                <div className="text-xs text-muted-foreground">
+                                                                    <span>{t('upstream_manager.identity_sync_status', {
+                                                                        users: identitySyncStatus.identity_count,
+                                                                        keys: identitySyncStatus.key_count,
+                                                                        time: identitySyncStatus.last_sync_at ? new Date(identitySyncStatus.last_sync_at).toLocaleString() : '-',
+                                                                    })}</span>
+                                                                    {identitySyncStatus.last_error && (
+                                                                        <span className="ml-2 text-danger">{identitySyncStatus.last_error}</span>
+                                                                    )}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>}
 
                                             <AdvancedSettings
                                                 open={upstreamAdvancedOpen}
@@ -2305,6 +2549,20 @@ export function Settings() {
                                     </SettingSection>
 
                                     <SettingSection
+                                        title={t('settings.identity_audit_title')}
+                                        description={t('settings.identity_audit_description')}
+                                    >
+                                        <ToggleSetting
+                                            label={t('settings.identity_audit_enabled')}
+                                            description={identityAuditEnabled
+                                                ? t('settings.identity_audit_enabled_hint')
+                                                : t('settings.identity_audit_disabled_hint')}
+                                            checked={identityAuditEnabled}
+                                            onCheckedChange={setIdentityAuditEnabled}
+                                        />
+                                    </SettingSection>
+
+                                    <SettingSection
                                         title={t('settings.tabs.upstreams')}
                                         description={t('settings.upstreams_description')}
                                         // 一屏只留一个实心强调色按钮,这里让位给底部的保存
@@ -2474,6 +2732,53 @@ export function Settings() {
                                                                     />
                                                                 </div>
                                                             </AdvancedSettingsGroup>
+
+                                                            {identityAuditEnabled && <AdvancedSettingsGroup title={t('upstream_manager.identity_resolution')} divider>
+                                                                <ToggleSetting
+                                                                    label={t('upstream_manager.identity_resolution')}
+                                                                    description={t('upstream_manager.identity_resolution_hint')}
+                                                                    checked={newIdentityEnabled}
+                                                                    onCheckedChange={setNewIdentityEnabled}
+                                                                />
+                                                                {newIdentityEnabled && (
+                                                                    <div className="grid grid-cols-1 gap-5 border-l-2 border-border pl-4 sm:grid-cols-2">
+                                                                        <FieldBlock label={t('upstream_manager.identity_provider')}>
+                                                                            <Select value="sub2api" disabled>
+                                                                                <SelectTrigger className="h-9 bg-background"><SelectValue /></SelectTrigger>
+                                                                                <SelectContent><SelectItem value="sub2api">Sub2API</SelectItem></SelectContent>
+                                                                            </Select>
+                                                                        </FieldBlock>
+                                                                        <FieldBlock label={t('upstream_manager.identity_admin_url')} hint={t('upstream_manager.identity_admin_url_hint')}>
+                                                                            <Input
+                                                                                value={newIdentityAdminBaseURL}
+                                                                                onChange={event => setNewIdentityAdminBaseURL(event.target.value)}
+                                                                                placeholder="https://sub2api.example.com/api/v1"
+                                                                                className="h-9 bg-background font-mono text-xs"
+                                                                            />
+                                                                        </FieldBlock>
+                                                                        <FieldBlock label={t('upstream_manager.identity_admin_key')}>
+                                                                            <Input
+                                                                                type="password"
+                                                                                value={newIdentityAdminAPIKey}
+                                                                                onChange={event => setNewIdentityAdminAPIKey(event.target.value)}
+                                                                                placeholder={t('upstream_manager.identity_key_required')}
+                                                                                required
+                                                                                className="h-9 bg-background font-mono text-xs"
+                                                                            />
+                                                                        </FieldBlock>
+                                                                        <FieldBlock label={t('upstream_manager.identity_sync_interval')}>
+                                                                            <Input
+                                                                                type="number"
+                                                                                min="60"
+                                                                                max="86400"
+                                                                                value={newIdentitySyncInterval}
+                                                                                onChange={event => setNewIdentitySyncInterval(Number(event.target.value))}
+                                                                                className="h-9 bg-background text-sm"
+                                                                            />
+                                                                        </FieldBlock>
+                                                                    </div>
+                                                                )}
+                                                            </AdvancedSettingsGroup>}
                                                         </AdvancedSettings>
                                                     </div>
 

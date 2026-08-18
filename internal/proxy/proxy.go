@@ -26,6 +26,7 @@ import (
 	"github.com/paopaoandlingyia/PrismCat/internal/requestoverride"
 	"github.com/paopaoandlingyia/PrismCat/internal/storage"
 	"github.com/paopaoandlingyia/PrismCat/internal/trace"
+	"github.com/paopaoandlingyia/PrismCat/internal/upstreamidentity"
 )
 
 type responseBodyFirstByteTimeoutError struct {
@@ -179,6 +180,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	loggingEnabled := !upstream.LoggingDisabled
+	logSensitiveHeaders := loggingCfg.SensitiveHeaders
+	identityEnabled := p.cfg.IdentityAuditEnabled() && upstream.IdentityResolution != nil && upstream.IdentityResolution.Provider == config.IdentityProviderSub2API
+	if identityEnabled {
+		logSensitiveHeaders = appendSensitiveHeaders(logSensitiveHeaders, "Authorization", "x-api-key", "x-goog-api-key")
+	}
 	if loggingEnabled && !upstream.LoggingPathFilter.Allows(requestURL.Path) {
 		loggingEnabled = false
 		if ignored, ok := p.repo.(storage.IgnoredPathRepository); ok {
@@ -216,13 +222,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		UpstreamTarget: upstream.TargetName,
 		Method:         r.Method,
 		Path:           requestURL.Path,
-		Query:          requestURL.RawQuery,
-		TargetURL:      upstreamURL.String(),
+		Query:          sanitizeIdentityQuery(requestURL.RawQuery, identityEnabled),
+		TargetURL:      sanitizeIdentityURL(upstreamURL, identityEnabled),
 		Tag:            r.Header.Get("X-PrismCat-Tag"),
 		TraceID:        traceID,
 		TraceSeq:       traceSeq,
 
-		RequestHeaders: p.sanitizeHeaders(r.Header, loggingCfg.SensitiveHeaders),
+		RequestHeaders: p.sanitizeHeaders(r.Header, logSensitiveHeaders),
+	}
+	if identityEnabled {
+		if secret, err := p.cfg.IdentityFingerprintSecret(); err == nil {
+			logEntry.APIKeyFingerprint = upstreamidentity.Fingerprint(secret, upstreamidentity.ExtractSub2APIKey(requestURL.Path, r.Header, upstreamURL.Query()))
+		}
 	}
 	if loggingEnabled {
 		logMu.Lock()
@@ -376,8 +387,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		logMu.Lock()
 		logEntry.RequestHeaderOverrideApplied = true
 		logEntry.RequestHeadersOriginal = logEntry.RequestHeaders
-		logEntry.RequestHeaders = p.sanitizeHeaders(upstreamReq.Header, loggingCfg.SensitiveHeaders)
-		if raw, err := json.Marshal(sanitizeHeaderChanges(headerChanges, loggingCfg.SensitiveHeaders)); err == nil {
+		logEntry.RequestHeaders = p.sanitizeHeaders(upstreamReq.Header, logSensitiveHeaders)
+		if raw, err := json.Marshal(sanitizeHeaderChanges(headerChanges, logSensitiveHeaders)); err == nil {
 			logEntry.RequestHeaderOverrideChanges = raw
 		}
 		if !logEntry.RequestOverrideApplied {
@@ -389,6 +400,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		logMu.Unlock()
+	}
+	if identityEnabled {
+		if secret, secretErr := p.cfg.IdentityFingerprintSecret(); secretErr == nil {
+			logEntry.APIKeyFingerprint = upstreamidentity.Fingerprint(secret, upstreamidentity.ExtractSub2APIKey(requestURL.Path, upstreamReq.Header, upstreamReq.URL.Query()))
+			logEntry.IdentityResolutionReady = logEntry.APIKeyFingerprint != ""
+		}
 	}
 	if webSocketUpgrade {
 		// These hop-by-hop headers are intentionally restored only for the
@@ -556,8 +573,71 @@ func (p *Proxy) finalizeAndSaveLog(log *storage.RequestLog, startTime time.Time,
 	p.applyRequestCapture(log, reqCap)
 	p.applyResponseCapture(log, respCap)
 	log.Latency = time.Since(startTime).Milliseconds()
+	if log.APIKeyFingerprint != "" {
+		log.IdentityResolutionReady = true
+	}
 
 	p.saveLogSnapshot(log)
+}
+
+func appendSensitiveHeaders(existing []string, required ...string) []string {
+	out := append([]string(nil), existing...)
+	for _, name := range required {
+		found := false
+		for _, current := range out {
+			if strings.EqualFold(current, name) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func sanitizeIdentityQuery(raw string, enabled bool) string {
+	if !enabled || raw == "" {
+		return raw
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return sanitizeIdentityQueryFallback(raw)
+	}
+	for name := range values {
+		if strings.EqualFold(name, "key") || strings.EqualFold(name, "api_key") {
+			values.Set(name, "***")
+		}
+	}
+	return values.Encode()
+}
+
+func sanitizeIdentityQueryFallback(raw string) string {
+	parts := strings.Split(raw, "&")
+	for i, part := range parts {
+		name, _, hasValue := strings.Cut(part, "=")
+		decoded, err := url.QueryUnescape(name)
+		if err != nil || (!strings.EqualFold(decoded, "key") && !strings.EqualFold(decoded, "api_key")) {
+			continue
+		}
+		if hasValue {
+			parts[i] = name + "=***"
+		}
+	}
+	return strings.Join(parts, "&")
+}
+
+func sanitizeIdentityURL(input *url.URL, enabled bool) string {
+	if input == nil {
+		return ""
+	}
+	if !enabled {
+		return input.String()
+	}
+	copy := *input
+	copy.RawQuery = sanitizeIdentityQuery(copy.RawQuery, true)
+	return copy.String()
 }
 
 func (p *Proxy) applyRequestCapture(log *storage.RequestLog, reqCap *limitedCapture) {

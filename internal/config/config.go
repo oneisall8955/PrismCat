@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"net/url"
 	"os"
@@ -18,18 +20,20 @@ const DefaultUpstreamTimeoutSeconds = 120
 
 // Config 应用配置
 type Config struct {
-	Server    ServerConfig              `yaml:"server"`
-	Upstreams map[string]UpstreamConfig `yaml:"upstreams"`
-	Logging   LoggingConfig             `yaml:"logging"`
-	LogRules  LoggingRulesConfig        `yaml:"logging_rules"`
-	Storage   StorageConfig             `yaml:"storage"`
-	Overrides RequestOverridesConfig    `yaml:"request_overrides"`
-	Usage     UsageExtractionConfig     `yaml:"usage_extraction"`
+	Server             ServerConfig                   `yaml:"server"`
+	Upstreams          map[string]UpstreamConfig      `yaml:"upstreams"`
+	Logging            LoggingConfig                  `yaml:"logging"`
+	LogRules           LoggingRulesConfig             `yaml:"logging_rules"`
+	Storage            StorageConfig                  `yaml:"storage"`
+	Overrides          RequestOverridesConfig         `yaml:"request_overrides"`
+	Usage              UsageExtractionConfig          `yaml:"usage_extraction"`
+	IdentityResolution IdentityResolutionGlobalConfig `yaml:"identity_resolution"`
 
-	configPath     string // 配置文件路径
-	fileUIPassword string
-	envUIPassword  bool
-	mu             sync.RWMutex
+	configPath              string // 配置文件路径
+	fileUIPassword          string
+	envUIPassword           bool
+	identityAuditConfigured bool
+	mu                      sync.RWMutex
 }
 
 // ServerConfig 服务器配置
@@ -79,6 +83,7 @@ type UpstreamConfig struct {
 	OutboundProxy                string                          `yaml:"outbound_proxy,omitempty"`
 	LoggingDisabled              bool                            `yaml:"logging_disabled,omitempty"`
 	LoggingPathFilter            *LoggingPathFilterConfig        `yaml:"logging_path_filter,omitempty"`
+	IdentityResolution           *IdentityResolutionConfig       `yaml:"identity_resolution,omitempty" json:"identity_resolution,omitempty"`
 	ActiveTarget                 string                          `yaml:"active_target,omitempty"`
 	Targets                      map[string]UpstreamTargetConfig `yaml:"targets,omitempty"`
 }
@@ -95,6 +100,26 @@ type UpstreamTargetConfig struct {
 	OutboundProxy                string                          `yaml:"outbound_proxy,omitempty" json:"outbound_proxy,omitempty"`
 	RequestOverrides             *RequestOverrideUpstreamBinding `yaml:"request_overrides,omitempty" json:"request_overrides,omitempty"`
 	UsageExtraction              *UsageExtractionUpstreamBinding `yaml:"usage_extraction,omitempty" json:"usage_extraction,omitempty"`
+	IdentityResolution           *IdentityResolutionConfig       `yaml:"identity_resolution,omitempty" json:"identity_resolution,omitempty"`
+}
+
+const (
+	IdentityProviderSub2API            = "sub2api"
+	DefaultIdentitySyncIntervalSeconds = 300
+)
+
+type IdentityResolutionGlobalConfig struct {
+	Enabled           bool   `yaml:"enabled" json:"enabled"`
+	FingerprintSecret string `yaml:"fingerprint_secret,omitempty" json:"-"`
+}
+
+type IdentityResolutionConfig struct {
+	Provider              string `yaml:"provider" json:"provider"`
+	AdminBaseURL          string `yaml:"admin_base_url,omitempty" json:"admin_base_url,omitempty"`
+	AdminAPIKey           string `yaml:"admin_api_key,omitempty" json:"-"`
+	SyncIntervalSeconds   int    `yaml:"sync_interval_seconds,omitempty" json:"sync_interval_seconds,omitempty"`
+	AdminAPIKeyConfigured bool   `yaml:"-" json:"admin_api_key_configured,omitempty"`
+	ClearAdminAPIKey      bool   `yaml:"-" json:"clear_admin_api_key,omitempty"`
 }
 
 // ResolvedUpstream is an immutable per-request routing snapshot. It keeps the
@@ -112,6 +137,7 @@ type ResolvedUpstream struct {
 	OutboundProxy                string
 	LoggingDisabled              bool
 	LoggingPathFilter            *LoggingPathFilterConfig
+	IdentityResolution           *IdentityResolutionConfig
 }
 
 type RequestOverridesConfig struct {
@@ -284,6 +310,15 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &c); err != nil {
 		return nil, fmt.Errorf("解析配置文件失败: %w", err)
 	}
+	var identityPresence struct {
+		IdentityResolution struct {
+			Enabled *bool `yaml:"enabled"`
+		} `yaml:"identity_resolution"`
+	}
+	if err := yaml.Unmarshal(data, &identityPresence); err != nil {
+		return nil, fmt.Errorf("解析身份审计配置失败: %w", err)
+	}
+	c.identityAuditConfigured = identityPresence.IdentityResolution.Enabled != nil
 
 	c.configPath = path
 	c.fileUIPassword = c.Server.UIPassword
@@ -341,6 +376,16 @@ func Load(path string) (*Config, error) {
 			c.Overrides.Enabled = enabled
 		}
 	}
+	if !c.identityAuditConfigured {
+		if raw := strings.TrimSpace(os.Getenv("PRISMCAT_IDENTITY_AUDIT_ENABLED")); raw != "" {
+			enabled, parseErr := strconv.ParseBool(raw)
+			if parseErr != nil {
+				return nil, fmt.Errorf("PRISMCAT_IDENTITY_AUDIT_ENABLED must be a boolean: %w", parseErr)
+			}
+			c.IdentityResolution.Enabled = enabled
+			c.identityAuditConfigured = true
+		}
+	}
 
 	c.Server = normalizeServerConfig(c.Server)
 
@@ -349,6 +394,18 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	c.Upstreams = normalizedUpstreams
+	// Preserve existing identity-enabled installations when upgrading from a
+	// config version that did not have the global audit switch.
+	if !c.identityAuditConfigured && hasIdentityResolutionInUpstreams(c.Upstreams) {
+		c.IdentityResolution.Enabled = true
+	}
+	if secret := strings.TrimSpace(c.IdentityResolution.FingerprintSecret); secret != "" {
+		decoded, decodeErr := base64.RawURLEncoding.DecodeString(secret)
+		if decodeErr != nil || len(decoded) < 32 {
+			return nil, fmt.Errorf("identity_resolution.fingerprint_secret must be base64url and at least 32 bytes")
+		}
+		c.IdentityResolution.FingerprintSecret = secret
+	}
 	logRules, err := NormalizeLoggingRules(c.LogRules)
 	if err != nil {
 		return nil, err
@@ -457,6 +514,9 @@ func normalizeUpstreams(in map[string]UpstreamConfig) (map[string]UpstreamConfig
 			if strings.TrimSpace(v.Target) != "" {
 				return nil, fmt.Errorf("upstream %q cannot define both target and targets", n)
 			}
+			if v.IdentityResolution != nil {
+				return nil, fmt.Errorf("upstream %q: identity_resolution must be configured per target", n)
+			}
 			targets, err := normalizeUpstreamTargets(n, v.Targets)
 			if err != nil {
 				return nil, err
@@ -491,6 +551,11 @@ func normalizeUpstreams(in map[string]UpstreamConfig) (map[string]UpstreamConfig
 				v.Timeout = DefaultUpstreamTimeoutSeconds
 			}
 			normalizeUpstreamStageTimeouts(&v)
+			identity, err := normalizeIdentityResolution(v.IdentityResolution)
+			if err != nil {
+				return nil, fmt.Errorf("upstream %q: %w", n, err)
+			}
+			v.IdentityResolution = identity
 		}
 		out[n] = v
 	}
@@ -534,12 +599,48 @@ func normalizeUpstreamTargets(upstreamName string, in map[string]UpstreamTargetC
 			binding.RuleNames = normalizeNameList(binding.RuleNames)
 			target.UsageExtraction = &binding
 		}
+		identity, err := normalizeIdentityResolution(target.IdentityResolution)
+		if err != nil {
+			return nil, fmt.Errorf("upstream %q target %q: %w", upstreamName, n, err)
+		}
+		target.IdentityResolution = identity
 		out[n] = target
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("upstream %q: targets must contain at least one valid target", upstreamName)
 	}
 	return out, nil
+}
+
+func normalizeIdentityResolution(in *IdentityResolutionConfig) (*IdentityResolutionConfig, error) {
+	if in == nil {
+		return nil, nil
+	}
+	out := *in
+	out.Provider = normalizeLower(out.Provider)
+	if out.Provider == "" {
+		return nil, nil
+	}
+	if out.Provider != IdentityProviderSub2API {
+		return nil, fmt.Errorf("unsupported identity resolution provider %q", out.Provider)
+	}
+	out.AdminBaseURL = strings.TrimRight(strings.TrimSpace(out.AdminBaseURL), "/")
+	if out.AdminBaseURL != "" {
+		u, err := url.Parse(out.AdminBaseURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return nil, fmt.Errorf("identity admin_base_url must be an absolute http(s) URL")
+		}
+	}
+	out.AdminAPIKey = strings.TrimSpace(out.AdminAPIKey)
+	out.AdminAPIKeyConfigured = false
+	out.ClearAdminAPIKey = false
+	if out.SyncIntervalSeconds == 0 {
+		out.SyncIntervalSeconds = DefaultIdentitySyncIntervalSeconds
+	}
+	if out.SyncIntervalSeconds < 60 || out.SyncIntervalSeconds > 86400 {
+		return nil, fmt.Errorf("identity sync_interval_seconds must be between 60 and 86400")
+	}
+	return &out, nil
 }
 
 func normalizeTargetStageTimeouts(target *UpstreamTargetConfig) {
@@ -820,6 +921,103 @@ func (c *Config) StorageSnapshot() StorageConfig {
 	return c.Storage
 }
 
+func (c *Config) IdentityFingerprintSecret() ([]byte, error) {
+	c.mu.RLock()
+	secret := strings.TrimSpace(c.IdentityResolution.FingerprintSecret)
+	c.mu.RUnlock()
+	if secret == "" {
+		return nil, fmt.Errorf("identity fingerprint secret is not initialized")
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(secret)
+	if err != nil || len(decoded) < 32 {
+		return nil, fmt.Errorf("identity fingerprint secret is invalid")
+	}
+	return decoded, nil
+}
+
+func hasIdentityResolutionInUpstreams(upstreams map[string]UpstreamConfig) bool {
+	for _, upstream := range upstreams {
+		if upstream.IdentityResolution != nil {
+			return true
+		}
+		for _, target := range upstream.Targets {
+			if target.IdentityResolution != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func identityAuditEnabledLocked(c *Config) bool {
+	if c.identityAuditConfigured {
+		return c.IdentityResolution.Enabled
+	}
+	return c.IdentityResolution.Enabled || hasIdentityResolutionInUpstreams(c.Upstreams)
+}
+
+// IdentityAuditEnabled reports whether upstream identity auditing is active.
+func (c *Config) IdentityAuditEnabled() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return identityAuditEnabledLocked(c)
+}
+
+// SetIdentityAuditEnabled records an explicit choice which will be persisted
+// to YAML and take precedence over the environment-provided initial value.
+func (c *Config) SetIdentityAuditEnabled(enabled bool) {
+	c.mu.Lock()
+	c.IdentityResolution.Enabled = enabled
+	c.identityAuditConfigured = true
+	c.mu.Unlock()
+}
+
+func (c *Config) HasIdentityResolution() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return hasIdentityResolutionInUpstreams(c.Upstreams)
+}
+
+// EnsureIdentityFingerprintSecretInitialized creates a portable HMAC secret
+// once identity resolution is enabled. It never falls back to an ephemeral key.
+func (c *Config) EnsureIdentityFingerprintSecretInitialized() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !identityAuditEnabledLocked(c) {
+		return nil
+	}
+	if strings.TrimSpace(c.IdentityResolution.FingerprintSecret) != "" {
+		return nil
+	}
+	enabled := false
+	for _, upstream := range c.Upstreams {
+		if upstream.IdentityResolution != nil {
+			enabled = true
+			break
+		}
+		for _, target := range upstream.Targets {
+			if target.IdentityResolution != nil {
+				enabled = true
+				break
+			}
+		}
+	}
+	if !enabled {
+		return nil
+	}
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return fmt.Errorf("generate identity fingerprint secret: %w", err)
+	}
+	secret := base64.RawURLEncoding.EncodeToString(raw)
+	c.IdentityResolution.FingerprintSecret = secret
+	if err := c.saveLocked(); err != nil {
+		c.IdentityResolution.FingerprintSecret = ""
+		return err
+	}
+	return nil
+}
+
 func (c *Config) RequestOverridesSnapshot() RequestOverridesConfig {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -1012,12 +1210,30 @@ func (c *Config) Save() error {
 }
 
 func (c *Config) saveLocked() error {
-	saved := *c
+	saved := struct {
+		Server             ServerConfig                   `yaml:"server"`
+		Upstreams          map[string]UpstreamConfig      `yaml:"upstreams"`
+		Logging            LoggingConfig                  `yaml:"logging"`
+		LogRules           LoggingRulesConfig             `yaml:"logging_rules"`
+		Storage            StorageConfig                  `yaml:"storage"`
+		Overrides          RequestOverridesConfig         `yaml:"request_overrides"`
+		Usage              UsageExtractionConfig          `yaml:"usage_extraction"`
+		IdentityResolution IdentityResolutionGlobalConfig `yaml:"identity_resolution"`
+	}{
+		Server:             c.Server,
+		Upstreams:          c.Upstreams,
+		Logging:            c.Logging,
+		LogRules:           c.LogRules,
+		Storage:            c.Storage,
+		Overrides:          c.Overrides,
+		Usage:              c.Usage,
+		IdentityResolution: c.IdentityResolution,
+	}
 	if c.envUIPassword {
 		saved.Server.UIPassword = c.fileUIPassword
 	}
 
-	data, err := yaml.Marshal(saved)
+	data, err := yaml.Marshal(&saved)
 	if err != nil {
 		return fmt.Errorf("序列化配置失败: %w", err)
 	}
@@ -1168,6 +1384,10 @@ func (c *Config) ListUpstreams() map[string]UpstreamConfig {
 func cloneUpstreamConfig(in UpstreamConfig) UpstreamConfig {
 	out := in
 	out.LoggingPathFilter = cloneLoggingPathFilter(in.LoggingPathFilter)
+	if in.IdentityResolution != nil {
+		identity := *in.IdentityResolution
+		out.IdentityResolution = &identity
+	}
 	if len(in.Targets) > 0 {
 		out.Targets = make(map[string]UpstreamTargetConfig, len(in.Targets))
 		for name, target := range in.Targets {
@@ -1181,6 +1401,10 @@ func cloneUpstreamConfig(in UpstreamConfig) UpstreamConfig {
 				binding := *target.UsageExtraction
 				binding.RuleNames = append([]string(nil), binding.RuleNames...)
 				next.UsageExtraction = &binding
+			}
+			if target.IdentityResolution != nil {
+				identity := *target.IdentityResolution
+				next.IdentityResolution = &identity
 			}
 			out.Targets[name] = next
 		}
@@ -1216,6 +1440,10 @@ func (c *Config) ResolveUpstreamSnapshot(name string) (ResolvedUpstream, Request
 		resolved.ResponseBodyFirstByteTimeout = upstream.ResponseBodyFirstByteTimeout
 		resolved.ResponseBodyIdleTimeout = upstream.ResponseBodyIdleTimeout
 		resolved.OutboundProxy = upstream.OutboundProxy
+		if upstream.IdentityResolution != nil {
+			identity := *upstream.IdentityResolution
+			resolved.IdentityResolution = &identity
+		}
 		return resolved, NormalizeRequestOverrides(overrides), true
 	}
 
@@ -1231,6 +1459,10 @@ func (c *Config) ResolveUpstreamSnapshot(name string) (ResolvedUpstream, Request
 	resolved.ResponseBodyFirstByteTimeout = target.ResponseBodyFirstByteTimeout
 	resolved.ResponseBodyIdleTimeout = target.ResponseBodyIdleTimeout
 	resolved.OutboundProxy = target.OutboundProxy
+	if target.IdentityResolution != nil {
+		identity := *target.IdentityResolution
+		resolved.IdentityResolution = &identity
+	}
 	if target.RequestOverrides == nil {
 		delete(overrides.Upstreams, name)
 	} else {

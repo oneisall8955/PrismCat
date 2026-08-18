@@ -274,6 +274,10 @@ server:
   proxy_domains:            # 子域名路由的基础域名
     - localhost
 
+identity_resolution:
+  enabled: false            # 身份审计总开关
+  fingerprint_secret: ""    # 首次启用时自动生成；迁移时需保留此配置
+
 logging:
   max_request_body: 5242880       # 请求内容最多保存 5MB
   max_response_body: 33554432     # 响应内容最多保存 32MB
@@ -308,6 +312,12 @@ upstreams:
           pattern: "/v1/responses"
         - matcher: regex
           pattern: "^/v1/chat/completions$"
+    # 目标为 Sub2API 时可启用身份关联
+    identity_resolution:
+      provider: sub2api
+      admin_base_url: "https://sub2api.example.com/api/v1" # 留空则从 target 推导
+      admin_api_key: "your-admin-key"
+      sync_interval_seconds: 300
   gemini:
     target: "https://generativelanguage.googleapis.com"
     timeout: 120
@@ -352,6 +362,24 @@ usage_extraction:
 ```
 
 </details>
+
+### 上游身份审计
+
+先在上游设置页开启全局“身份审计”，再为 Sub2API 上游或目标预设启用“上游身份关联”。PrismCat 会使用 `x-api-key` 调用 Sub2API Admin API，同步用户和 API Key，并在请求日志成功落库后异步补写对应的 Sub2API 用户 ID；同步失败不会延迟或中断代理请求。
+
+- `identity_resolution.enabled` 是总开关。关闭后停止 Key 指纹采集、目录同步、陌生 Key 刷新和日志补关联，并隐藏日志身份列、筛选与详情；上游中已填写的关联配置和历史日志身份结果会保留。
+- `PRISMCAT_IDENTITY_AUDIT_ENABLED` 仅在 YAML 没有明确 `enabled` 时提供首次默认值。通过 UI 保存开关后，配置文件中的值优先。已有身份关联配置的旧版本升级时会自动保持开启。
+
+- 日志归属由“上游 + 目标预设 + 用户 ID”共同确定，适用于多个实例存在相同用户 ID 的情况。
+- 数据库只保存 HMAC-SHA256 Key 指纹和原始用户 ID，不保存用户名、邮箱或 API Key 明文；用户名和邮箱仅从当前缓存展示。
+- 已关联日志的用户 ID 不会被后续同步改写。上线前没有指纹的旧日志不会回填，上线后暂时未解析的日志会在同步或重启后重试。
+- Admin Key 和指纹密钥不会通过配置 API 返回。编辑时 Admin Key 留空表示保留，需使用单独的清除操作删除。
+- 迁移实例时应同时迁移配置文件和数据库。更换 `fingerprint_secret` 只影响尚未解析的日志。
+- 设置页的“测试连接”只验证 Admin API；“刷新身份目录”拉取全部用户和 Key，成功后仅把日志补关联任务放入后台队列，不等待历史日志扫描完成。
+- 没有认证 Key 的请求不会创建指纹或触发身份任务。未知或错误 Key 在目录有效期内会直接复用“不匹配”结果；目录过期时，同一上游无论出现多少未知 Key 都只合并为一次刷新，刷新失败后按配置的同步周期重试。
+- 未匹配日志会记录本次 Key 目录的内部版本。同一目录内容下不会反复扫描这些日志；上游新增 Key 或改变归属后目录版本变化，日志会重新参与补关联。
+
+日志页必须先选择上游，随后可在用户筛选框下方的弹出表格中按用户名、邮箱或 ID 搜索并分页选择。多目标上游会合并展示，并在来源列标注目标预设；选中用户时仍会同时提交上游、目标预设和 ID。身份刷新按钮会按当前精确来源异步补关联待处理日志，并显示匹配与未匹配数量。JSONL 导出包含 `upstream_identity_id`，不包含指纹或当前展示名称。
 
 ---
 

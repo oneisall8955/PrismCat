@@ -13,6 +13,7 @@ import (
 	"github.com/paopaoandlingyia/PrismCat/internal/config"
 	"github.com/paopaoandlingyia/PrismCat/internal/server"
 	"github.com/paopaoandlingyia/PrismCat/internal/storage"
+	"github.com/paopaoandlingyia/PrismCat/internal/upstreamidentity"
 )
 
 const defaultYAML = `
@@ -43,6 +44,9 @@ storage:
   max_storage_bytes: 0            # 0 = no limit
   blob_store: "fs"
   blob_dir: "data/blobs"
+
+identity_resolution:
+  enabled: false
 
 usage_extraction:
   enabled: false
@@ -142,6 +146,9 @@ func main() {
 	if err := cfg.EnsureModelPathTemplatesInitialized(); err != nil {
 		log.Fatalf("初始化模型日志路径模板失败: %v", err)
 	}
+	if err := cfg.EnsureIdentityFingerprintSecretInitialized(); err != nil {
+		log.Fatalf("初始化上游身份指纹密钥失败: %v", err)
+	}
 	log.Printf("PrismCat %s 启动中...", config.Version)
 	log.Printf("配置已加载: DetachBodyOverBytes=%d, BodyPreviewBytes=%d",
 		cfg.Logging.DetachBodyOverBytes, cfg.Logging.BodyPreviewBytes)
@@ -166,6 +173,12 @@ func main() {
 	}
 
 	asyncRepo := storage.NewAsyncRepository(sqliteRepo, cfg, cfg.Storage.AsyncBuffer, blobStore)
+	identityManager := upstreamidentity.New(cfg, sqliteRepo)
+	if err := identityManager.Start(); err != nil {
+		log.Fatalf("初始化上游身份关联失败: %v", err)
+	}
+	asyncRepo.SetAfterSaveHook(identityManager.AfterSave)
+	defer identityManager.Close()
 	defer asyncRepo.Close()
 
 	// Best-effort log retention cleanup.
@@ -252,7 +265,7 @@ func main() {
 	defer close(stopRetention)
 
 	// 启动服务器
-	srv := server.New(cfg, asyncRepo, blobStore)
+	srv := server.New(cfg, asyncRepo, blobStore, identityManager)
 
 	// 平台相关的运行逻辑（Windows: 系统托盘, 其他: 直接运行）
 	if err := platformRun(srv, cfg, *showConsole); err != nil {

@@ -37,8 +37,10 @@ type AsyncRepository struct {
 	inflightCond *sync.Cond
 	inflight     int64
 
-	wg      sync.WaitGroup
-	dropped atomic.Uint64
+	wg          sync.WaitGroup
+	dropped     atomic.Uint64
+	afterSaveMu sync.RWMutex
+	afterSave   func(*RequestLog)
 
 	ignoredMu                sync.Mutex
 	pendingIgnored           map[ignoredPathKey]IgnoredPathObservation
@@ -74,10 +76,20 @@ func NewAsyncRepository(inner Repository, cfg *config.Config, buffer int, blobs 
 	go func() {
 		defer a.wg.Done()
 		for entry := range a.ch {
+			if !entry.IdentityResolutionReady {
+				entry.APIKeyFingerprint = ""
+			}
 			PrepareLogForPersistence(entry, a.cfg, a.blobs)
 			if err := a.inner.SaveLog(entry); err != nil {
 				// Best-effort: avoid crashing the proxy path.
 				log.Printf("save log failed: %v", err)
+				continue
+			}
+			a.afterSaveMu.RLock()
+			hook := a.afterSave
+			a.afterSaveMu.RUnlock()
+			if hook != nil {
+				hook(entry.Clone())
 			}
 		}
 	}()
@@ -107,6 +119,12 @@ func NewAsyncRepository(inner Repository, cfg *config.Config, buffer int, blobs 
 	}
 
 	return a
+}
+
+func (a *AsyncRepository) SetAfterSaveHook(hook func(*RequestLog)) {
+	a.afterSaveMu.Lock()
+	a.afterSave = hook
+	a.afterSaveMu.Unlock()
 }
 
 // Dropped returns the number of logs dropped due to a full queue.

@@ -24,6 +24,7 @@ import (
 	"github.com/paopaoandlingyia/PrismCat/internal/proxy"
 	"github.com/paopaoandlingyia/PrismCat/internal/storage"
 	"github.com/paopaoandlingyia/PrismCat/internal/trace"
+	"github.com/paopaoandlingyia/PrismCat/internal/upstreamidentity"
 )
 
 //go:embed all:ui
@@ -180,28 +181,34 @@ func (h spaFSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // Server HTTP 服务器
 type Server struct {
-	cfg    *config.Config
-	repo   storage.Repository
-	blobs  storage.BlobStore
-	live   *live.Registry
-	proxy  *proxy.Proxy
-	api    *api.Handler
-	auth   *auth.Manager
-	server *http.Server
+	cfg      *config.Config
+	repo     storage.Repository
+	blobs    storage.BlobStore
+	live     *live.Registry
+	proxy    *proxy.Proxy
+	api      *api.Handler
+	auth     *auth.Manager
+	identity *upstreamidentity.Manager
+	server   *http.Server
 }
 
 // New 创建服务器实例
-func New(cfg *config.Config, repo storage.Repository, blobs storage.BlobStore) *Server {
+func New(cfg *config.Config, repo storage.Repository, blobs storage.BlobStore, identityManagers ...*upstreamidentity.Manager) *Server {
 	liveRegistry := live.NewRegistry(cfg.LoggingSnapshot().BodyPreviewBytes)
 	traceSeq := trace.NewSequencer()
+	var identityManager *upstreamidentity.Manager
+	if len(identityManagers) > 0 {
+		identityManager = identityManagers[0]
+	}
 	return &Server{
-		cfg:   cfg,
-		repo:  repo,
-		blobs: blobs,
-		live:  liveRegistry,
-		proxy: proxy.New(cfg, repo, liveRegistry, traceSeq),
-		api:   api.New(cfg, repo, blobs, liveRegistry),
-		auth:  auth.NewManager(cfg),
+		cfg:      cfg,
+		repo:     repo,
+		blobs:    blobs,
+		live:     liveRegistry,
+		proxy:    proxy.New(cfg, repo, liveRegistry, traceSeq),
+		api:      api.New(cfg, repo, blobs, liveRegistry, identityManager),
+		auth:     auth.NewManager(cfg),
+		identity: identityManager,
 	}
 }
 
